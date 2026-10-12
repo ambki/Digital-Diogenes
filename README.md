@@ -13,6 +13,8 @@ documented in its own section below, in the order they are used:
 The R scripts used for reporting live in [`R_plots/`](R_plots/), and the
 scripts that generate test data live in [`support_scripts/`](support_scripts/).
 
+The whole pipeline has been positively tested in WindowsOS 11 in storage volumes up to 40 Tbs of size. Nevertheless, it can work in linux systems as well and for bigger storage sizes. 
+
 ## Table of contents
 
 - [duplicates_check.py](#duplicates_checkpy)
@@ -316,10 +318,7 @@ somewhere in the destination at all, regardless of where.
 
 ### Generating test data
 
-[`support_scripts\generate_duplicate_test_data.py`](support_scripts/generate_duplicate_test_data.py)
-builds a folder structure with known duplicates, mismatches, and missing
-files, so you can exercise every mode above (and features like `--threading`
-and the progress bar) without needing real backup data.
+To test the script, you can run [`support_scripts\generate_duplicate_test_data.py`](support_scripts/generate_duplicate_test_data.py), which builds a folder structure with known duplicates, mismatches, and missing files. You can test as well every mode above (and features like `--threading` and the progress bar) without needing real backup data.
 
 ```powershell
 python support_scripts\generate_duplicate_test_data.py --path "C:\path\to\test_area" --mode all --large-file-mb 20 --num-files 1
@@ -401,10 +400,7 @@ Where the 1.6 GB goes (size per file from the table above × 6 million):
 | **Total during the scan** | **~1.6 GB** |
 | **Peak, while writing the CSV exports** | **~4 GB** |
 
-For comparison, storing the same data with the alternatives in the first
-table would need ~18.7 GB, more than twice the RAM of an 8 GB machine.
-
-Other choices made for the same reason:
+Other choices made for RAM efficiency:
 
 - `--resume-from` reads only the `path` column of the raw CSV, not all of it.
 - The pre-hash raw CSV is appended to disk per scan instead of being kept
@@ -496,9 +492,7 @@ final export, which builds a second full table, is the next thing to trim.
 
 ## elimination_file_candidates.py
 
-Scans a folder (recursively, across all subfolders) for files that are
-candidates for elimination, so you know what could be safely deleted and how
-much space it would free up.
+This is a script to detect specific formats/folders that the user is interested to eliminate, others than duplicates. It is now tailored to (spectral) flowcytometry, but you can fork it and add another requirements. Concretely, it scans a folder (recursively, across all subfolders) for files that are candidates for elimination, so you know what could be safely deleted and how much space it would free up.
 
 ### What it does
 
@@ -509,7 +503,7 @@ Three candidate groups, each built from the same folder scan:
 - **ZIP files** — files with a `.zip` extension (case-insensitive).
 - **Unmixed folder files** — files that live anywhere inside a folder named
   `Unmixed` (case-insensitive, at any depth). The folder itself isn't
-  reported — the files inside it are.
+  reported — the files inside it are. Specific to detect folders with unmixed files from spectral flowcytometry.
 
 For each group, and globally across all three, it reports:
 
@@ -523,7 +517,7 @@ For each group, and globally across all three, it reports:
 It also saves a barplot (PNG) showing storage size per group and, globally,
 as absolute numbers.
 
-### Why "summed" and "unique" differ globally
+### Why "summed" and "unique" groups in the barplot
 
 A file can belong to more than one group — e.g. an old `.zip` sitting inside
 an `Unmixed` folder counts as both an "old file" and a "ZIP file" and an
@@ -618,12 +612,7 @@ python elimination_file_candidates.py --folder "C:\path\to\folder" --no-plots
 
 ### Generating test data
 
-[`support_scripts\generate_elimination_test_data.py`](support_scripts/generate_elimination_test_data.py)
-builds a folder structure with known old files, `.zip` files, `Unmixed`
-folder files, and a file that overlaps all three groups at once (to exercise
-the summed/unique/overlap accounting), plus a control file next to each
-group that should **not** be flagged. Use it to try out the modes above
-without needing real backup data.
+To test the script, you can run [`support_scripts\generate_elimination_test_data.py`](support_scripts/generate_elimination_test_data.py), which builds a folder structure with known old files, `.zip` files, `Unmixed` folder files, and a file that overlaps all three groups at once (to exercise the summed/unique/overlap accounting). There is also a control file next to each group that should **not** be flagged. Use it to try out the modes above without needing real backup data.
 
 ```powershell
 python support_scripts\generate_elimination_test_data.py --path "C:\path\to\test_area" --mode all --years 10 --num-files 1
@@ -690,10 +679,11 @@ the generated data.
 Takes the duplicate list produced by `duplicates_check.py --folder` and, for
 every group of identical files (same md5), keeps the **oldest** copy where it
 is and moves every other copy into a `duplicates` folder under the same
-storage root. It then re-hashes everything in `duplicates` to prove that
-exactly the expected files landed there, unchanged.
+storage root. The oldest file is kept because the oldest file is "a priori" the first generated, so the "rawest". Duplicates come from this very first (and oldest) file. 
 
-Nothing is deleted. Space is only freed once you have reviewed the reports
+The script then re-hashes everything in `duplicates` to prove that exactly the expected files landed there, unchanged.
+
+**Nothing is deleted**. Space is only freed once you have reviewed the reports
 and delete the `duplicates` folder yourself. Until then, every move can be
 reversed with `undo`.
 
@@ -720,8 +710,7 @@ For a group `R:\A\scan.tif` (oldest), `R:\B\scan.tif`, `R:\C\x\scan.tif`:
   summary CSV).
 - `R:\B\scan.tif` → `R:\duplicates\B\scan.tif`
 - `R:\C\x\scan.tif` → `R:\duplicates\C\x\scan.tif`
-- `R:\B\original_file_location.txt` and `R:\C\x\original_file_location.txt`
-  get one line each, for example:
+- In each of the duplicate locations a `R:\B\original_file_location.txt` and/or `R:\C\x\original_file_location.txt` files are created, pointing to the location of the oldest file. For example:
 
   ```
   moved_file: scan.tif | now_at: R:\duplicates\B\scan.tif | original_kept_at: R:\A\scan.tif | md5: a3f… | moved_on: 2026-10-06 12:11:02
@@ -1041,8 +1030,7 @@ for a large volume use `--no-preflight`, or raise `--workers` (e.g. 32).
 Shares usually handle many parallel stats well.
 
 **Time for `execute` on a large volume.** Each move takes a few network
-round trips (~4), so 6M moves at ~20 ms per file would take more than a
-day on one thread. With `--workers 16` it's a few hours. Verify then
+round trips (~4), so 6 million moves/files at ~20 ms per file would take more than a day on one thread. With `--workers 16` it's a few hours. Verify then
 re-reads all the moved data, like a duplicates_check.py scan of it.
 
 ### Resuming after a crash or kill
