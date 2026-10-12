@@ -382,20 +382,27 @@ The results DataFrame is built column-wise at the end, and its `path`
 column points at the *same* string objects as the file list rather than
 copying them.
 
-Approximate footprint of those structures at 6 million files:
+#### How much RAM a scan needs
 
-| | Before | Now |
-|---|---|---|
-| File list | 7.0 GB | ~1 GB |
-| Pending tasks | 9.7 GB | ~0 |
-| Size / mtime | 0.8 GB | 0.1 GB |
-| Results | 1.2 GB | 0.5 GB |
-| **Total** | **~18.7 GB** | **~1.6 GB** |
+**A scan of 6 million files uses about 1.6 GB of RAM while it finds,
+stats and hashes the files, and peaks at roughly 4 GB at the very end,
+while it writes the CSV exports** (which briefly makes temporary copies of
+the result tables). RAM use grows roughly in proportion to the number of
+files scanned, so smaller scans need correspondingly less.
 
-With temporary copies made while writing the CSV exports, expect a peak
-of roughly 4 GB at that scale. At 1 million files the old layout needed
-~3 GB, which is why it used to work fine on smaller storage and only broke
-down at 6 million.
+Where the 1.6 GB goes (size per file from the table above × 6 million):
+
+| What the script holds in RAM | RAM at 6 million files |
+|---|---|
+| File list (every file's path) | ~1 GB |
+| Pending hashing tasks (`--threading`) | ~0 |
+| Every file's size and modification time | 0.1 GB |
+| Every file's MD5 (results) | 0.5 GB |
+| **Total during the scan** | **~1.6 GB** |
+| **Peak, while writing the CSV exports** | **~4 GB** |
+
+For comparison, storing the same data with the alternatives in the first
+table would need ~18.7 GB, more than twice the RAM of an 8 GB machine.
 
 Other choices made for the same reason:
 
