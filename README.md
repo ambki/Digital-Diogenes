@@ -1,0 +1,1192 @@
+# Digital-Diogenes
+
+Tools for finding, verifying and cleaning up duplicate and obsolete files on
+large storage volumes. The repository contains three Python scripts, each
+documented in its own section below, in the order they are used:
+
+| Step | Script | Purpose |
+|---|---|---|
+| 1. Analyse | [`duplicates_check.py`](#duplicates_checkpy) | Scans one or two folders for duplicate files (by MD5) and verifies backups against their source. |
+| 1. Analyse | [`elimination_file_candidates.py`](#elimination_file_candidatespy) | Scans a folder for files that are candidates for elimination (old files, ZIP files, files in `Unmixed` folders). Independent of `duplicates_check.py`, but run at the same step: it also gives insight into the data before anything is eliminated. |
+| 2. Clean up | [`quarantine_duplicates.py`](#quarantine_duplicatespy) | Uses the duplicate list from `duplicates_check.py --folder` to move every copy but the oldest into a reversible `duplicates` quarantine folder. |
+
+The R scripts used for reporting live in [`R_plots/`](R_plots/), and the
+scripts that generate test data live in [`support_scripts/`](support_scripts/).
+
+## Table of contents
+
+- [duplicates_check.py](#duplicates_checkpy)
+  - [What it does](#what-it-does)
+  - [Requirements](#requirements)
+  - [Usage](#usage)
+  - [How each mode actually works](#how-each-mode-actually-works)
+  - [Generating test data](#generating-test-data)
+  - [Memory use on large scans](#memory-use-on-large-scans)
+  - [Arguments](#arguments)
+  - [Notes](#notes)
+- [elimination_file_candidates.py](#elimination_file_candidatespy)
+  - [What it does](#what-it-does-1)
+  - [Why "summed" and "unique" differ globally](#why-summed-and-unique-differ-globally)
+  - [Requirements](#requirements-1)
+  - [Usage](#usage-1)
+  - [Arguments](#arguments-1)
+  - [Generating test data](#generating-test-data-1)
+  - [Notes](#notes-1)
+- [quarantine_duplicates.py](#quarantine_duplicatespy)
+  - [Workflow at a glance](#workflow-at-a-glance)
+  - [What happens to the files](#what-happens-to-the-files)
+  - [Requirements](#requirements-2)
+  - [Inputs: which file goes into which option](#inputs-which-file-goes-into-which-option)
+  - [Usage](#usage-2)
+  - [Progress steps: what each bar is doing](#progress-steps-what-each-bar-is-doing)
+  - [Resuming after a crash or kill](#resuming-after-a-crash-or-kill)
+  - [Skip reasons](#skip-reasons)
+  - [Arguments](#arguments-2)
+  - [Output files (in `--output`)](#output-files-in---output)
+  - [Design decisions](#design-decisions)
+  - [Notes](#notes-2)
+
+---
+
+## duplicates_check.py
+
+Scans one or two folders for duplicate files (by MD5 checksum) and, when given
+an origin/destination pair, verifies that a backup is a faithful copy of its
+source.
+
+### What it does
+
+- **Duplicate scan** — recursively hashes every file in a folder and reports
+  groups of files that share the same MD5 (true duplicates), how much space
+  they waste, and their paths.
+- **Cross-folder duplicates** (`between`) — finds files that exist in *both*
+  the origin and destination with the same MD5, regardless of filename or
+  path.
+- **Integrity check** (`integrity`) — for every file in the origin, checks
+  whether the same relative path exists in the destination and whether its
+  MD5 matches. Reports `OK`, `MISMATCH`, `MISSING IN DEST`, or `UNREADABLE`.
+
+Results are printed to the terminal (at most the top 50 rows per table, so a
+huge scan doesn't spend hours formatting output). Passing `--excel` additionally writes
+every result table to its own CSV file (despite the flag's name — see
+"Also export results" below for why it's CSV, not an actual `.xlsx`).
+
+Every duplicate group (in `folder`/`origin`/`destination`/`between`) also
+reports the **oldest copy** — the file with the earliest modification time —
+as `oldest_path` and `oldest_modified`. For `between`, `oldest_source` says
+whether that oldest copy lives in the origin or the destination. The idea is
+to keep that one file and safely delete the rest of the group.
+
+### Requirements
+
+- Python 3.10+
+- `pandas`, `tqdm`
+
+```powershell
+pip install pandas tqdm
+```
+
+### Usage
+
+Run from the repository root.
+
+#### Compare two folders (origin vs. destination/backup)
+
+Runs all checks: origin duplicates, destination duplicates, cross-folder
+duplicates, and integrity comparison.
+
+```powershell
+python duplicates_check.py --origin "C:\path\to\origin" --destination "C:\path\to\destination"
+```
+
+#### Scan a single folder for duplicates
+
+```powershell
+python duplicates_check.py --folder "C:\path\to\folder"
+```
+
+#### Run only one check
+
+Use `--mode` with an origin/destination pair:
+
+```powershell
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode integrity
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode between
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode origin
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode destination
+```
+
+#### Also export results
+
+Add `--excel` with a target path to additionally write every result table to
+its own CSV file. Omit it to only print to the terminal.
+
+```powershell
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --excel "C:\reports\duplicates_report.xlsx"
+```
+
+Despite the flag's name (kept as `--excel` since that's the established
+option — it just takes a base path, the extension you give it is ignored),
+**nothing gets written as an actual `.xlsx` file.** Instead, one CSV per
+result table lands next to the path you gave, named `<stem>_<table>.csv` —
+for the command above: `duplicates_report_origin_duplicates.csv`,
+`duplicates_report_origin_summary.csv`, `duplicates_report_between_summary.csv`,
+`duplicates_report_integrity_results.csv`, `duplicates_report_skipped_folders.csv`,
+plus `duplicates_report_raw.csv` (see below) — whichever of those apply to
+the `--mode` you ran. The terminal output tells you exactly which files got
+written and where.
+
+This is CSV rather than an Excel workbook on purpose: Excel sheets are
+capped at 1,048,576 rows, and several of these tables have no a-priori
+bounded size — `*_duplicates` scales with how much of the scan turned out
+to be duplicated (a heavily-duplicated multi-million-file scan can put
+nearly every file in it), and `integrity_results` has one row per origin
+file, duplicate or not. Either can blow straight through that cap on a big
+scan — and when a single sheet in a workbook is too large, `openpyxl`
+raises `This sheet is too large!` and **the whole write fails, nothing
+gets saved at all**, not even the other sheets that would have fit fine.
+Only `*_summary`/`skipped_folders` are reliably small regardless of scan
+size, but since any of the others can fail unpredictably depending on your
+specific data, everything is CSV for certainty rather than just the ones
+most likely to be huge. CSV also writes/reads far faster at
+multi-million-row scale besides.
+
+`<stem>_raw.csv` is a plain, one-row-per-file listing of every file the
+script scanned (not just duplicates/mismatches): `filename`, `path`,
+`mtime` (human-readable), `md5`, and `size_gb`. Meant for further analysis
+outside the script — e.g. loading into R to bucket files by year and chart
+storage growth over time — rather than for reading directly. It's written
+at a different point than the others, and actually written **twice**: once
+right after each folder's file list and size/date are collected but
+*before* hashing starts (same columns, minus `md5`, since it isn't known
+yet), and again at the very end with `md5` filled in. On a big scan,
+hashing (reading every file's full contents) is by far the slowest part,
+so the early write gets you a usable file listing on disk well before that
+finishes — useful on its own, and also what `--resume-from` (below) reads
+from if hashing gets interrupted.
+
+#### Resume an interrupted scan
+
+If a big scan gets interrupted partway through hashing (crash, closed
+terminal, etc.), you don't have to re-walk the whole folder tree again —
+point `--resume-from` at the raw export it already wrote (the early
+pre-hash version, or a final one from a previous run) instead of `--folder`/
+`--origin`/`--destination`'s usual walk:
+
+```powershell
+python duplicates_check.py --folder "C:\path\to\folder" --excel "C:\reports\duplicates_report.xlsx" --resume-from "C:\reports\duplicates_report_raw.csv"
+```
+
+This reuses the file list from that export but still re-collects each
+file's size/mtime and re-hashes it fresh — it's not blindly trusting old
+metadata, just skipping the (often much slower, on a big remote folder)
+directory-by-directory walk. A file that's been deleted since the export
+was written is simply treated as unreadable, same as an ordinary permission
+error, rather than causing an error. For `--origin`/`--destination`, one
+export covering both sides works fine — files are matched back to origin or
+destination by which root their path falls under. `--resume-from` can't be
+combined with `--included`/`--excluded`, since the file list it loads is
+already fixed.
+
+The paths in the export are used exactly as written, so they must be
+reachable from the terminal you resume in. This matters for **mapped drive
+letters** (e.g. `Z:\...`): they belong to one logon session, so an
+elevated/"Run as administrator" terminal, a scheduled task, or another user
+usually doesn't see them, even though the same share works elsewhere. Before
+doing anything else, the script stats a sample of 20 paths spread across the
+list and stops with an error if none of them can be accessed. A warning is
+also printed if resumed paths aren't under `--folder` (a mapped drive and its
+`\\server\share` path count as different places here). In any scan, files
+that fail to stat or hash are counted and reported with their first few
+error messages, and a run where *every* file fails to stat stops before
+hashing instead of writing empty results.
+
+#### Speed up hashing with threading
+
+By default, files are hashed one at a time. For large scans (thousands of
+files, some multi-GB) on storage that supports concurrent reads — a network
+volume that allows several users at once, or a local SSD/NVMe — add
+`--threading` to hash several files in parallel:
+
+```powershell
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --threading
+```
+
+`--threading` uses 8 worker threads by default. Tune that with `--workers`
+(only valid together with `--threading`):
+
+```powershell
+python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --threading --workers 16
+```
+
+Notes on choosing a worker count:
+
+- More workers helps mainly by overlapping I/O wait time (multiple reads "in
+  flight" at once), and to a lesser extent lets MD5 computation itself run on
+  multiple CPU cores.
+- On a single spinning disk, too many concurrent reads can cause seek
+  thrashing and make things *slower* — keep `--threading` off or use a low
+  worker count there.
+- On a network volume, your own network link (and the server's total
+  capacity across all its users) is still the ceiling — pushing worker count
+  far past what the link/server can service in parallel won't add more
+  speed.
+- There's no universal best value; 8 is a reasonable starting point to tune
+  up or down from.
+
+#### Restrict the scan to, or exclude, specific subfolders
+
+By default the scan covers everything under `--folder`/`--origin`/`--destination`.
+To narrow that down — e.g. to scan a huge folder in smaller pieces to save
+time/RAM, or to skip a subfolder you know is slow/irrelevant — use
+`--included` or `--excluded` (not both) with one or more paths:
+
+```powershell
+python duplicates_check.py --folder "C:\path\to\folder" --included "C:\path\to\folder\2023" "C:\path\to\folder\2024"
+python duplicates_check.py --folder "C:\path\to\folder" --excluded "C:\path\to\folder\Trash"
+```
+
+`--included` and `--excluded` both apply to whichever folder(s) the current
+`--mode` scans (`--folder`, or `--origin`/`--destination`). Duplicates are
+still only found *within a single run* — scanning `2023` and `2024` together
+in one `--included` call finds duplicates between them, but scanning them as
+two *separate* runs would not, since each run only sees its own files. See
+[Also export results](#also-export-results) above for combining separate runs' raw
+listings afterward if you do need to split the scan across multiple
+invocations.
+
+### How each mode actually works
+
+Every mode starts from the same scan: a table of `path, filename, size_bytes, md5`
+for each file in a folder. The modes differ only in how they compare rows of
+that table.
+
+#### `folder` / `origin` / `destination` — duplicates inside one folder
+
+Groups the rows of **a single folder's table** by `md5`. Any hash that shows
+up 2+ times is a duplicate group — filenames and paths are irrelevant.
+
+> Answers: *"does this exact content exist more than once inside this one
+> folder?"*
+
+#### `between` — duplicates across the two folders
+
+Stacks the origin table and the destination table together, then groups by
+`md5` again — same logic as above, but now checking whether a hash appears
+**on both sides**. Filenames and paths are still irrelevant; a file that was
+renamed or moved to a completely different subfolder in the destination still
+counts as a match.
+
+> Answers: *"does this exact content exist somewhere in both folders,
+> wherever it happens to sit?"*
+
+#### `integrity` — did the backup copy succeed, file by file?
+
+This one does **not** start by comparing hashes across all files. It matches
+files by **relative path** first, then checks the hash only for that matched
+pair:
+
+1. Take an origin file, e.g. `origin_root\2024\img001.tif` → relative path
+   `2024\img001.tif`.
+2. Look for that *same relative path* under the destination root, e.g.
+   `destination_root\2024\img001.tif`.
+3. Based on what it finds there:
+   - No file at that relative path in the destination → **MISSING IN DEST**
+   - File exists, but the MD5 couldn't be read on one side → **UNREADABLE**
+   - File exists, MD5s match → **OK**
+   - File exists, MD5s differ → **MISMATCH**
+
+> Answers: *"for every file the origin has, does the destination have that
+> exact same file, in that exact same location?"*
+
+#### Why `between` and `integrity` can disagree
+
+Say `origin\2024\img001.tif` was backed up but landed at
+`destination\archive\img001.tif` instead of `destination\2024\img001.tif`:
+
+- `integrity` looks for `2024\img001.tif` in the destination, doesn't find it
+  there → reports **MISSING IN DEST**, even though the file did get copied.
+- `between` ignores location entirely and just checks "is this md5 present in
+  both folders?" → finds it → reports it as a cross-folder duplicate, not
+  missing.
+
+So: `integrity` tells you whether the backup mirrors the origin's folder
+structure faithfully; `between` tells you whether the content exists
+somewhere in the destination at all, regardless of where.
+
+### Generating test data
+
+[`support_scripts\generate_duplicate_test_data.py`](support_scripts/generate_duplicate_test_data.py)
+builds a folder structure with known duplicates, mismatches, and missing
+files, so you can exercise every mode above (and features like `--threading`
+and the progress bar) without needing real backup data.
+
+```powershell
+python support_scripts\generate_duplicate_test_data.py --path "C:\path\to\test_area" --mode all --large-file-mb 20 --num-files 1
+```
+
+| Argument           | Description                                                                                   |
+|--------------------|-------------------------------------------------------------------------------------------------|
+| `--path`           | Base folder where the test folders will be created. Required.                                   |
+| `--mode`           | Which check to build a scenario for: `all` (default), `folder`, `origin`, `destination`, `between`, `integrity`. |
+| `--large-file-mb`  | Size in MB of each large duplicated file pair, used to actually exercise the progress bar and `--threading`. Default: **20**. |
+| `--num-files`      | Multiplier applied to every fixture group (duplicate groups, moved/OK/mismatch/missing files, large pairs), keeping their proportions fixed while scaling up total file count — e.g. `--num-files 50` gives 50 duplicate groups, 50 moved files, 50 large pairs, etc. instead of 1 of each. Default: **1**. |
+| `--clean`          | Remove this script's own previously generated subfolders (`folder_test`, `origin`, `destination`) under `--path` before regenerating. Never touches anything else under `--path`. |
+
+Use `--num-files` for a longer-running scenario with many files (to watch the
+progress bar/`files_left` counter tick over time, and give `--threading`
+enough parallel work to matter) and `--large-file-mb` for a single file large
+enough to watch its own hash crawl along — they're independent knobs.
+
+For `--mode all` it creates:
+
+- `folder_test\` — for `duplicates_check.py --folder ... --mode folder`: unique
+  files, a small duplicate group, and a large duplicate pair.
+- `origin\` and `destination\` — for the origin/destination modes:
+  - a duplicate group inside `origin\` only (for `--mode origin`)
+  - a duplicate group inside `destination\` only (for `--mode destination`)
+  - a file moved to a different relative path with identical content in the
+    destination (for `--mode between` — see *Why `between` and `integrity`
+    can disagree* above)
+  - one matching file (`OK`), one file edited after backup (`MISMATCH`), and
+    one file never copied (`MISSING IN DEST`) (for `--mode integrity`)
+  - an identical large file pair on both sides
+
+For any other `--mode`, only the fixtures relevant to that check are built
+(plus a baseline file so origin/destination are never empty).
+
+It prints the exact `duplicates_check.py` command to run against the
+generated data. `UNREADABLE` status isn't simulated, since that requires
+OS-level permission changes rather than file content.
+
+### Memory use on large scans
+
+The script is built to scan millions of files on a machine with modest RAM
+(it was tuned against ~6 million files on an 8 GB server). This matters
+because in Python *every* value is its own object with a fixed overhead
+(an int is 28 bytes, a float 24, a string 49 bytes plus its text), so at
+millions of files the overhead, not the data, is what fills RAM. Once RAM
+runs out, Windows starts swapping to disk and the scan slows to a crawl
+that looks exactly like a hang (a progress bar that stops moving for hours).
+
+Per-file state is therefore kept in the cheapest form available:
+
+| Kept per file | Stored as | Why not the obvious alternative |
+|---|---|---|
+| File path | a plain `str` (~150 B) | A `pathlib.Path` (~1,170 B) caches the full path *plus* a list of every folder name *plus* a lowercased copy of each (used on Windows for case-insensitive comparison), i.e. the text ~3 times over across ~17 small objects. |
+| Size and modification time | two numpy arrays (16 B total), indexed by file position | A `{path: (size, mtime)}` dict costs ~130 B per file (hash slot + tuple + int object + float object). |
+| MD5 | one list of strings (~90 B), same indexing | A 5-key dict per file (~190 B) duplicates the size/mtime already stored and adds its own overhead. |
+| Pending work with `--threading` | at most `workers × 64` tasks in flight | `executor.map()` creates *every* task up front, one `Future` (~1.6 KB, with its own lock/condition) per file, before returning a single result. |
+
+The results DataFrame is built column-wise at the end, and its `path`
+column points at the *same* string objects as the file list rather than
+copying them.
+
+Approximate footprint of those structures at 6 million files:
+
+| | Before | Now |
+|---|---|---|
+| File list | 7.0 GB | ~1 GB |
+| Pending tasks | 9.7 GB | ~0 |
+| Size / mtime | 0.8 GB | 0.1 GB |
+| Results | 1.2 GB | 0.5 GB |
+| **Total** | **~18.7 GB** | **~1.6 GB** |
+
+With temporary copies made while writing the CSV exports, expect a peak
+of roughly 4 GB at that scale. At 1 million files the old layout needed
+~3 GB, which is why it used to work fine on smaller storage and only broke
+down at 6 million.
+
+Other choices made for the same reason:
+
+- `--resume-from` reads only the `path` column of the raw CSV, not all of it.
+- The pre-hash raw CSV is appended to disk per scan instead of being kept
+  in memory for the rest of the run.
+- The terminal shows at most the top 50 rows of each table; formatting a
+  table with hundreds of thousands of rows can take hours with no output.
+  The full tables are in the CSV exports.
+
+If RAM still climbs toward the machine's limit, note which stage it's in
+(finding files, collecting file info, hashing, or writing results); the
+final export, which builds a second full table, is the next thing to trim.
+
+### Arguments
+
+| Argument        | Description                                                                 |
+|-----------------|-------------------------------------------------------------------------------|
+| `--folder`      | Single folder to scan recursively for duplicates. Mutually exclusive with `--origin`/`--destination`. |
+| `--origin`      | Origin/source folder to scan. Required together with `--destination`.        |
+| `--destination` | Destination/backup folder to scan. Required together with `--origin`.        |
+| `--mode`        | Which check(s) to run: `all` (default), `folder`, `origin`, `destination`, `between`, `integrity`. |
+| `--excel`       | Optional base path; if given, writes every result table to its own `<stem>_<table>.csv` (not an actual `.xlsx`, despite the flag's name — see above). If omitted, results are only printed to the terminal. |
+| `--threading`   | Hash files concurrently using multiple threads. Off by default.              |
+| `--workers`     | Number of hashing threads to use. Requires `--threading`. Default: 8.        |
+| `--io-timeout`  | Seconds to wait for a single blocking filesystem operation (listing a folder, stat'ing a file, or reading a file for hashing) before giving up on it and moving on. Default: 30. |
+| `--included`    | Restrict the scan to only these subfolder(s) (and their contents). One or more paths. Mutually exclusive with `--excluded`. Default: scan everything. |
+| `--excluded`    | Skip these subfolder(s) (and their contents) during the scan. One or more paths. Mutually exclusive with `--included`. Default: nothing excluded. |
+| `--resume-from` | Path to a previously written `..._raw.csv` export; resumes from its file list instead of re-walking the folder(s). Mutually exclusive with `--included`/`--excluded`. |
+
+### Notes
+
+- "Oldest copy" is based on file **modification time** (not creation time),
+  since that's consistent across platforms — a file copied to a new location
+  generally keeps its original modification time, so this points at the
+  original rather than whichever copy happened to be scanned first.
+- A progress bar is shown while each folder is hashed, tracking **bytes
+  hashed** against the folder's total size (not file count) — a truer
+  measure of progress when file sizes vary a lot, e.g. many small files
+  alongside a few multi-GB ones. It also shows the number of files left as
+  extra info alongside the bar.
+- Every phase of scanning — finding files, collecting each file's size/date,
+  and hashing — has its own live progress bar showing the current
+  file/folder name (`now=...`), so on a big folder you can always tell it's
+  still working through files rather than stuck, without needing to guess.
+- Each folder is hashed **at most once per run**, regardless of `--mode`. The
+  origin and destination scans are computed once and reused across the
+  duplicates, `between`, and `integrity` checks, so `--mode all` does not
+  re-hash files for each check.
+- Unreadable files (permission errors, etc.) are excluded from duplicate
+  detection but still counted as `UNREADABLE` in the integrity check.
+- **Long paths (over 260 characters) are scanned too.** Windows' classic
+  limit (MAX_PATH) makes any folder or file whose full path is longer than
+  260 characters unreachable ("The system cannot find the path specified")
+  unless the system setting `LongPathsEnabled` is on, which it isn't by
+  default. Every filesystem call (listing a folder, stat'ing, opening to
+  hash) therefore uses the Windows extended-length form `\\?\C:\...` /
+  `\\?\UNC\server\share\...`, which lifts the limit regardless of that
+  setting. Paths in every output keep their normal form. This also applies
+  to `elimination_file_candidates.py` and `quarantine_duplicates.py`, which
+  reuse these helpers.
+- A folder or file that can't be accessed at all is skipped rather than
+  aborting the whole scan — whether it fails fast (permission denied, a
+  corrupted folder) or just hangs without ever raising an error (an
+  unreachable network path, a stuck handle — the kind of folder that also
+  hangs Explorer or `cmd`). This covers every blocking filesystem call the
+  script makes: listing a folder's contents, `stat`'ing a file (size/mtime),
+  and reading a file's bytes to hash it — a folder can list fine while one
+  specific file inside it is what's actually stuck, so all three needed
+  their own protection, not just the folder listing. Anything unresponsive
+  is given up on after `--io-timeout` seconds (default: 30; tune it down
+  for a faster scan on a flaky network, or up if some folders/files are
+  just slow rather than actually stuck). For hashing, the timeout counts
+  time with *no data read*, not total time, so a multi-GB file that keeps
+  making progress is always hashed to the end. A skipped **folder** means its
+  contents (and, in turn, all of its subfolders) are never analyzed at all;
+  a skipped **file**'s stat and/or hash falls back to unreadable
+  (size 0 / `md5=None`, same as an ordinary permission error) without
+  affecting the rest of the scan. Either way, a warning is printed
+  immediately, a final count of skipped folders is printed once scanning
+  finishes ("N folder(s) could not be accessed..."), and with `--excel` the
+  skipped folders are also recorded in a `..._skipped_folders.csv` (scope,
+  folder, error) so it's not just a scrolled-past console line.
+- The integrity check matches files by path *relative* to each root folder,
+  so folder structure must line up between origin and destination for a file
+  to be recognized as present.
+- Hashing is MD5 over the full file content, done in 1 MB chunks, so large
+  folders can take a while to scan.
+
+---
+
+## elimination_file_candidates.py
+
+Scans a folder (recursively, across all subfolders) for files that are
+candidates for elimination, so you know what could be safely deleted and how
+much space it would free up.
+
+### What it does
+
+Three candidate groups, each built from the same folder scan:
+
+- **Old files** — files whose modification time is older than `--years`
+  years ago (default: 10).
+- **ZIP files** — files with a `.zip` extension (case-insensitive).
+- **Unmixed folder files** — files that live anywhere inside a folder named
+  `Unmixed` (case-insensitive, at any depth). The folder itself isn't
+  reported — the files inside it are.
+
+For each group, and globally across all three, it reports:
+
+- File count and total size.
+- The top directories by size within that group (a quick way to spot where
+  most of the space is going).
+- The full list of file paths in that group — printed to the terminal (up to
+  50 rows, then a count of the rest) and always written in full to the Excel
+  workbook if `--excel` is given.
+
+It also saves a barplot (PNG) showing storage size per group and, globally,
+as absolute numbers.
+
+### Why "summed" and "unique" differ globally
+
+A file can belong to more than one group — e.g. an old `.zip` sitting inside
+an `Unmixed` folder counts as both an "old file" and a "ZIP file" and an
+"Unmixed folder file". The global report shows two numbers so nothing is
+silently double-counted:
+
+- **Summed** — each group's count/size added up as-is. A file in two groups
+  is counted twice.
+- **Unique (deduplicated)** — the same files counted once by path. This is
+  the number that reflects how much disk space you'd actually free up by
+  deleting every candidate.
+- **Overlap** — the count/size of files that fall into more than one group,
+  i.e. the gap between the two numbers above.
+
+### Requirements
+
+- Python 3.10+
+- `pandas`, `tqdm`, `matplotlib` (and `openpyxl` if using `--excel`)
+
+```powershell
+pip install pandas tqdm matplotlib openpyxl
+```
+
+`elimination_file_candidates.py` also imports `validate_folder` and
+`export_results_to_excel` from `duplicates_check.py`, so both files must stay
+in the same folder.
+
+### Usage
+
+Run from the repository root.
+
+#### Basic scan
+
+```powershell
+python elimination_file_candidates.py --folder "C:\path\to\folder"
+```
+
+#### Also export full results to Excel
+
+```powershell
+python elimination_file_candidates.py --folder "C:\path\to\folder" --excel "C:\reports\elimination_candidates.xlsx"
+```
+
+This writes the workbook itself (`summary` and `skipped_folders` sheets —
+see Notes below) plus several companion CSVs next to it:
+
+- `elimination_candidates_raw.csv` — every file the scan found, regardless
+  of group (`filename`, `path`, `mtime`, `size_gb`). Written as soon as the
+  scan finishes, since the walk/stat step already covers every file no
+  matter which groups you asked for — this is effectively free. Same
+  columns as `duplicates_check.py`'s own raw export (minus `md5`, since
+  this script never hashes), so it also works as a `--resume-from` input
+  there — see [Resume an interrupted scan](#resume-an-interrupted-scan) in
+  the `duplicates_check.py` section for using it to scope a duplicate scan to a
+  particular subset of files without re-walking the folder.
+- `elimination_candidates_old_files.csv`, `..._zip_files.csv`, and
+  `..._unmixed_files.csv` — one per group, each a full listing of just the
+  files in that group.
+
+These are CSV rather than workbook sheets because a group like "old files"
+(or the raw listing) can easily hold millions of rows on a big scan, and
+Excel sheets are capped at 1,048,576 rows — CSV has no such limit and
+writes much faster besides.
+
+#### Change the "old files" age threshold
+
+Default is 10 years.
+
+```powershell
+python elimination_file_candidates.py --folder "C:\path\to\folder" --years 5
+```
+
+#### Change where barplots are saved, or skip them
+
+```powershell
+python elimination_file_candidates.py --folder "C:\path\to\folder" --plots-dir "C:\reports\plots"
+python elimination_file_candidates.py --folder "C:\path\to\folder" --no-plots
+```
+
+### Arguments
+
+| Argument      | Description                                                                          |
+|---------------|----------------------------------------------------------------------------------------|
+| `--folder`    | Folder to scan recursively. Required.                                                  |
+| `--years`     | Age threshold in years for the "old files" group. Default: 10.                         |
+| `--excel`     | Optional path to write results to an Excel workbook (summary/skipped-folders sheets), plus a companion raw CSV (every file scanned) and one CSV per group with its full per-file listing (see above). |
+| `--plots-dir` | Directory to save barplot PNGs into. Default: `elimination_plots`.                     |
+| `--no-plots`  | Skip generating barplots.                                                              |
+| `--io-timeout` | Seconds to wait for a single blocking filesystem operation (listing a folder or stat'ing a file) before giving up on it and moving on. Default: 30. |
+| `--included`   | Restrict the scan to only these subfolder(s) (and their contents), under `--folder`. One or more paths. Mutually exclusive with `--excluded`. Default: scan everything. |
+| `--excluded`   | Skip these subfolder(s) (and their contents) during the scan, under `--folder`. One or more paths. Mutually exclusive with `--included`. Default: nothing excluded. |
+
+### Generating test data
+
+[`support_scripts\generate_elimination_test_data.py`](support_scripts/generate_elimination_test_data.py)
+builds a folder structure with known old files, `.zip` files, `Unmixed`
+folder files, and a file that overlaps all three groups at once (to exercise
+the summed/unique/overlap accounting), plus a control file next to each
+group that should **not** be flagged. Use it to try out the modes above
+without needing real backup data.
+
+```powershell
+python support_scripts\generate_elimination_test_data.py --path "C:\path\to\test_area" --mode all --years 10 --num-files 1
+```
+
+| Argument      | Description                                                                                   |
+|---------------|-------------------------------------------------------------------------------------------------|
+| `--path`      | Base folder where the test folder will be created. Required.                                    |
+| `--mode`      | Which group to build a scenario for: `all` (default), `old`, `zip`, `unmixed`.                  |
+| `--years`     | Age threshold (in years) to build fixtures around — pass the same value to `elimination_file_candidates.py --years`. Default: **10**. |
+| `--num-files` | Multiplier applied to every fixture group, keeping proportions fixed while scaling up total file count. Default: **1**. |
+| `--clean`     | Remove this script's own previously generated subfolder (`elimination_test`) under `--path` before regenerating. Never touches anything else under `--path`. |
+
+It prints the exact `elimination_file_candidates.py` command to run against
+the generated data.
+
+### Notes
+
+- "Old" is based on file **modification time** (not creation time), for the
+  same reason as in `duplicates_check.py` — it's consistent across platforms
+  and survives files being copied to a new location.
+- Files that can't be `stat()`'d (permission errors, etc.) are treated as
+  size 0 and excluded from the "old files" check (their real age is
+  unknown), but can still show up under ZIP or Unmixed, since those checks
+  only depend on the filename/path.
+- The Excel workbook (when `--excel` is given) has a `summary` sheet with
+  the count/size numbers for each group, and a `skipped_folders` sheet (see
+  below). The full per-file listing — both the raw "every file scanned"
+  export and each group's own listing — is written as CSVs instead of
+  workbook sheets — see "Also export full results to Excel" above.
+- Both scanning phases — finding files and collecting each file's metadata —
+  have their own live progress bar showing the current file/folder name
+  (`now=...`), so on a big folder you can always tell it's still working
+  through files rather than stuck, without needing to guess.
+- A folder or file that can't be accessed at all is skipped rather than
+  aborting the whole scan — whether it fails fast (permission denied, a
+  corrupted folder) or just hangs without ever raising an error (an
+  unreachable network path, a stuck handle — the kind of folder that also
+  hangs Explorer or `cmd`). This covers both listing a folder's contents
+  and `stat`'ing a file (size/mtime), since a folder can list fine while a
+  specific file inside it is what's actually stuck. Anything unresponsive
+  is given up on after `--io-timeout` seconds (default: 30). A skipped
+  **folder** means its contents (and all of its subfolders) are never
+  analyzed at all; a skipped **file** falls back to unreadable (same as an
+  ordinary permission error) without affecting the rest of the scan.
+  Either way, a warning is printed immediately, a final count of skipped
+  folders is printed once scanning finishes ("N folder(s) could not be
+  accessed..."), and with `--excel` the skipped folders are also recorded
+  in the `skipped_folders` sheet (scope, folder, error).
+- **Long paths (over 260 characters) are scanned too**, regardless of the
+  Windows `LongPathsEnabled` setting: folder listing and `stat` go through
+  `duplicates_check.py`'s helpers, which use the extended-length form
+  `\\?\C:\...` / `\\?\UNC\server\share\...` for every filesystem call.
+  Paths in the outputs keep their normal form. See "Long paths" in the
+  [`duplicates_check.py` notes](#notes).
+- No file hashing is done here (unlike `duplicates_check.py`) — only
+  filename, path, size, and modification time are needed, so scanning is
+  fast even on large folders.
+
+---
+
+## quarantine_duplicates.py
+
+Takes the duplicate list produced by `duplicates_check.py --folder` and, for
+every group of identical files (same md5), keeps the **oldest** copy where it
+is and moves every other copy into a `duplicates` folder under the same
+storage root. It then re-hashes everything in `duplicates` to prove that
+exactly the expected files landed there, unchanged.
+
+Nothing is deleted. Space is only freed once you have reviewed the reports
+and delete the `duplicates` folder yourself. Until then, every move can be
+reversed with `undo`.
+
+### Workflow at a glance
+
+```
+duplicates_check.py --folder ROOT --excel scan.xlsx
+        │  scan_folder_duplicates.csv + scan_folder_summary.csv
+        ▼
+quarantine_duplicates.py plan      → move_plan_<timestamp>.csv   (dry run, review it)
+        ▼
+quarantine_duplicates.py execute   → moves + notes + journal, then verify
+        ▼
+quarantine_duplicates.py verify    → (optional) re-run the md5 check alone
+quarantine_duplicates.py undo      → (optional) put everything back
+quarantine_duplicates.py remaining → raw listing of what stays after deleting `duplicates`, no rehash
+```
+
+### What happens to the files
+
+For a group `R:\A\scan.tif` (oldest), `R:\B\scan.tif`, `R:\C\x\scan.tif`:
+
+- `R:\A\scan.tif` stays. It is the **keeper** (`oldest_path` in the
+  summary CSV).
+- `R:\B\scan.tif` → `R:\duplicates\B\scan.tif`
+- `R:\C\x\scan.tif` → `R:\duplicates\C\x\scan.tif`
+- `R:\B\original_file_location.txt` and `R:\C\x\original_file_location.txt`
+  get one line each, for example:
+
+  ```
+  moved_file: scan.tif | now_at: R:\duplicates\B\scan.tif | original_kept_at: R:\A\scan.tif | md5: a3f… | moved_on: 2026-10-06 12:11:02
+  ```
+
+The `duplicates` folder **mirrors the original folder structure**, so files
+with the same name from different folders never collide, and every file's
+origin can be read from its path. There is **one note per source folder**,
+appended to, with one line per file moved out of it. A folder whose files
+were all moved keeps only its note. That is intended.
+
+### Requirements
+
+- Python 3.10+
+- `pandas`, `tqdm`
+
+`quarantine_duplicates.py` imports helpers from `duplicates_check.py`, so both
+files must stay in the same folder.
+
+### Inputs: which file goes into which option
+
+Every input comes from **one single run of `duplicates_check.py` in folder
+mode** (`--folder`) on the storage you want to clean. For example:
+
+```powershell
+python duplicates_check.py --folder "R:\" --excel "C:\reports\duplicates_analysis\duplicates_report.xlsx"
+```
+
+In folder mode, `--excel` only sets the **folder and base name** of the
+outputs. No `.xlsx` workbook is written; instead you get these CSVs next to
+where the workbook would be:
+
+| File written by duplicates_check.py | Contents | Used by quarantine_duplicates.py as |
+|---|---|---|
+| `duplicates_report_folder_duplicates.csv` | one row per duplicated file: `path, filename, size_bytes, mtime, md5` | `plan --duplicates-csv` |
+| `duplicates_report_folder_summary.csv` | one row per md5 group, incl. `oldest_path` (the keeper) | `plan --summary-csv` |
+| `duplicates_report_raw.csv` | every file scanned: `filename, path, mtime, md5, size_gb` | `remaining --raw-csv` (found automatically next to `--duplicates-csv`; pass it only if you moved it) |
+| `duplicates_report_skipped_folders.csv` | folders that couldn't be scanned | not an input. Check it yourself: files in those folders were never checked for duplicates |
+
+The other options are not files from the analysis:
+
+| Option | What to give |
+|---|---|
+| `plan --root` | **Exactly the same folder** given to `duplicates_check.py --folder`, in the same spelling (`R:\` and `\\server\share\` count as different). `duplicates` is created directly under it. |
+| `plan --output` | Any folder for the plan and all reports, e.g. `C:\reports\quarantine`. Not inside `<root>\duplicates`. |
+| `execute` / `verify` / `undo` / `remaining` `--plan` | The `move_plan_<timestamp>.csv` that `plan` wrote into `--output`. Its `_settings.json` must stay next to it: it records the root and the two input CSVs, which is why these commands need no other input. |
+
+Rules:
+
+- **All inputs from the same run.** The duplicates and summary CSVs are
+  cross-checked. If they come from different runs, the affected groups are
+  skipped (`NO_KEEPER_IN_SUMMARY`, `KEEPER_NOT_IN_LIST`). Any path outside
+  `--root` stops the plan.
+- **Leave the input CSVs where they are** until you've finished with this
+  plan. `execute` re-reads them (through the settings file) to check that
+  the plan wasn't changed beyond `MOVE`↔`SKIP`.
+- **Use the final raw CSV, not the early one.** duplicates_check.py writes
+  `_raw.csv` once before hashing (no `md5` column) and overwrites it when
+  the scan finishes. If the scan was interrupted, `remaining` refuses the
+  md5-less file.
+- **Use folder-mode outputs, not origin/destination ones.**
+  `_between_summary.csv` pairs each file with its **backup copy**, so
+  "deduplicating" it would remove your backup. It and
+  `_integrity_results.csv` are refused anyway: they lack the required
+  columns. `_origin_duplicates.csv` + `_origin_summary.csv` (and the
+  `_destination_` pair) have the same format as the folder-mode files and
+  would work with `--root` set to that side's folder. Since paths outside
+  `--root` stop the plan, a mix-up with the other side can't move anything,
+  but a dedicated `--folder` run is clearer.
+
+Full example with the files above:
+
+```powershell
+python quarantine_duplicates.py plan `
+    --duplicates-csv "C:\reports\duplicates_analysis\duplicates_report_folder_duplicates.csv" `
+    --summary-csv    "C:\reports\duplicates_analysis\duplicates_report_folder_summary.csv" `
+    --root   "R:\" `
+    --output "C:\reports\quarantine"
+
+python quarantine_duplicates.py execute   --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+python quarantine_duplicates.py remaining --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+```
+
+### Usage
+
+Run from the repository root.
+
+#### 0. Scan for duplicates (folder mode)
+
+```powershell
+python duplicates_check.py --folder "R:\" --excel "C:\reports\scan.xlsx" --excluded "R:\duplicates"
+```
+
+Use `--excluded "R:\duplicates"` once a `duplicates` folder exists. Otherwise
+every quarantined file is reported again together with its keeper. The plan
+step refuses such groups anyway (`IN_DUPLICATES_FOLDER`).
+
+#### 1. Plan (dry run, moves nothing)
+
+```powershell
+python quarantine_duplicates.py plan `
+    --duplicates-csv "C:\reports\scan_folder_duplicates.csv" `
+    --summary-csv    "C:\reports\scan_folder_summary.csv" `
+    --root   "R:\" `
+    --output "C:\reports\quarantine"
+```
+
+Prints a summary and writes `move_plan_<timestamp>.csv` plus
+`move_plan_<timestamp>_settings.json` (the root, inputs and filters used)
+into `--output`:
+
+```
+Groups: 1240 | Files to move: 3512 (412.700 GB) | Long paths (> 259 chars, moved and flagged): 2
+Skipped: ZERO_BYTE 88 | EXCLUDED_PATTERN 41 | KEEPER_CHANGED 3 | DUPLICATE_MISSING 7
+```
+
+The plan has one row per file in the duplicate list:
+
+| column | meaning |
+|---|---|
+| `action` | `MOVE`, `SKIP` or `KEEP` (the keeper) |
+| `reason`, `detail` | why a row is `SKIP` (see *Skip reasons*) |
+| `role` | `keeper`, `duplicate` (may be moved), or `blocked` (its group can't be moved, see `reason`) |
+| `md5`, `size_bytes`, `size_gb`, `mtime`, `modified` | from the scan (`modified` is UTC, like duplicates_check.py) |
+| `original_path` | where the file is now |
+| `duplicates_path` | where it will go |
+| `keeper_path`, `keeper_size_bytes`, `keeper_mtime` | the copy that stays, and its scan size/mtime |
+| `long_path` | destination longer than 259 characters (see *Long paths*) |
+| `check` | fingerprint of the row's role, md5, paths and scan values, used by `execute` to detect edits |
+
+**Review it**, for example in R. In particular, check that the keepers sit in
+sensible places: "oldest" is not always "the right one".
+
+**Profiling a plan in R:
+[`quarantine_plan.R`](R_plots/quarantine_plan.R).** Plots and tables of what the plan
+would do, in number of files *and* in storage space. The two can differ a
+lot: on Volume B, most of the volume's files could be moved but only a
+small share of its space, because most duplicates are small files. Set `plan_path`, `raw_path`
+(duplicates_check.py's `_raw.csv` of the same scan) and `output_folder` in
+the configuration block, run section **0. Setup** once, then run any section
+on its own, in any order (RStudio: Ctrl+Alt+T runs the current section).
+Each section shows its plot; its last line exports it into `output_folder`
+(run it or skip it):
+
+| Section | What it shows | Exported as |
+|---|---|---|
+| 1. Files vs space | Moved / keeper / skipped / unique files, as a share of the volume's files and of its space | `quarantine_volume_share.png` |
+| 2. Size of the files to move | Share of files vs share of space per size class | `quarantine_move_size_classes.png` |
+| 3. Copies per group | How many identical copies each file has; top groups by copies and by space | `quarantine_copies_per_group.png`, `quarantine_top_groups.csv` |
+| 4. Top folders | The folders (two levels under the root) with the most files to move and the most space to free | `quarantine_top_folders.png` |
+
+Setup reads the plan in chunks and keeps only a few small columns per row,
+so even Volume B's multi-GB plan stays around 1.3 GB of RAM (about 2–3 minutes).
+Section 1 is the only one that reads the raw listing, so it is the slowest
+section. Don't open a large plan with a plain `read_csv`: it loads every
+path into memory.
+
+**Editing the plan:** the only supported edit is changing `action` between
+`MOVE` and `SKIP` (for files you'd rather not touch). Anything else, such as a
+different keeper, edited paths or a keeper set to `MOVE`, is detected and
+`execute` refuses to run: each row's `check` no longer matches, or its
+`role` doesn't allow `MOVE`. Edit it with R or a text editor, **not Excel**:
+Excel rewrites md5 values that look like numbers (`123e4567…`) and shortens
+mtimes, which makes the plan fail validation.
+
+**Large volumes (millions of duplicates): use `--no-preflight`.** It skips
+the checks against the volume while planning (see *Progress steps*). The plan
+is then built from the CSVs alone, in minutes. `execute` still checks every
+file before moving it, so this is only less informative, not less safe:
+stale-file skips show up in the execute results instead of in the plan.
+
+Plans made by an earlier version of this script (without `role`/`check`)
+are refused. Re-run `plan`.
+
+#### 2. Execute
+
+```powershell
+python quarantine_duplicates.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+```
+
+It does the following:
+
+1. Validates the whole plan (see *Editing the plan*) before moving anything.
+2. Creates `<root>\duplicates` if it doesn't exist.
+3. For each `MOVE` row, on `--workers` threads (default 8; e.g. 16–32 for a
+   large volume):
+   - checks the **keeper** exists at `keeper_path` (so also by its file name)
+     with the scan's size and mtime. If not, the whole group is skipped.
+   - checks the duplicate itself still has the scan's size and mtime.
+   - moves it (`os.rename`), appends its note line, then appends its journal
+     line.
+4. Writes `<plan>_execute_results.csv` (one row per `MOVE` row).
+5. Runs **verify** (step 3 below), unless `--no-verify` is given.
+
+#### 3. Verify
+
+Runs automatically after `execute`. Run it alone with:
+
+```powershell
+python quarantine_duplicates.py verify --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --threading
+```
+
+It re-hashes **every file under `<root>\duplicates`** and matches it to the
+journal by **expected path and md5**. md5 alone isn't enough, because
+duplicates share md5s by definition. It writes `<plan>_verify_report.csv`:
+
+| status | meaning |
+|---|---|
+| `OK` | moved, found at the expected path, md5 matches |
+| `MISSING` | journal says moved, but not found in `duplicates` |
+| `MD5_MISMATCH` | found, but content differs from the scanned file |
+| `UNREADABLE` | found, but could not be hashed |
+| `EXTRA` | in `duplicates` but not an expected move of this plan |
+| `MOVED_NOT_JOURNALED` | found, but the journal has no line (killed mid-file). Re-run `execute` |
+| `NOT_MOVED` | `MOVE` row that wasn't moved; `detail` has the execute outcome (`MOVE_FAILED: …`, `SKIPPED_KEEPER_CHANGED`, …) |
+| `SKIPPED_<reason>` | row that was `SKIP` in the plan |
+| `UNSCANNED_FOLDER` | a folder in `duplicates` that couldn't be listed |
+
+Columns: `status, detail, md5_expected, md5_found, original_path,
+duplicates_path, keeper_path, size_bytes, size_found, mtime_original,
+mtime_found, long_path`. This is the "missing / extra / raw metadata" report.
+
+**Reporting on an execution in R:
+[`quarantine_execution.R`](R_plots/quarantine_execution.R).** Plots of what
+`execute`, verify and `undo` actually did, from the files they write next to
+the plan. Set `plan_path` (the executed plan) and `output_folder`, run
+**0. Setup** once (it reads nothing big), then any section on its own; each
+reads the file it needs the first time, in chunks, and its last line exports
+the plot:
+
+| Section | What it shows | From | Exported as |
+|---|---|---|---|
+| 1. Execute outcome | Moved / skipped by a safety check / problem, per status, in files and space | `_execute_results.csv` (last run) | `execution_outcome.png` |
+| 2. Progress over time | Cumulative files and space moved, all runs; restores by `undo` count down | `_journal.csv` + `_undo_journal.csv` | `execution_timeline.png` |
+| 3. Verification | `OK`, `NOT_MOVED`, `SKIPPED_*` and problem statuses, in files and space | `_verify_report.csv` | `execution_verification.png` |
+| 4. Problems | Files execute couldn't move, by error type and by folder | `_execute_results.csv` | `execution_problems.png`, `execution_problems.csv` |
+| 5. Space per folder | What is in `duplicates` now, per original folder (net of restores) | `_journal.csv` + `_undo_journal.csv` | `execution_space_by_folder.png` |
+
+#### 4. Undo (if needed)
+
+```powershell
+python quarantine_duplicates.py undo --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+```
+
+Moves every journaled file back, removes its line from
+`original_file_location.txt` (deleting the note once it's empty), and removes
+the mirrored folders left empty in `duplicates`. A file is only restored if
+the original location is free and the size in `duplicates` matches. Otherwise
+it's reported as `CONFLICT`. Writes `<plan>_undo_journal.csv` and
+`<plan>_undo_results.csv`. It is safe to re-run.
+
+#### 5. Raw listing of the remaining files (no rehash)
+
+```powershell
+python quarantine_duplicates.py remaining --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+```
+
+Writes `<plan>_remaining_raw.csv`: the volume's file listing as it will be
+once you delete `duplicates`, without rehashing the volume. It is built from:
+
+- duplicates_check.py's raw listing of the scan (`<stem>_raw.csv`, found next
+  to the plan's `--duplicates-csv`, or given with `--raw-csv`),
+- **minus** every file currently moved out. That list comes from replaying
+  the journal and the undo journal: a file counts as moved if its latest
+  event is a move, so files put back by `undo` stay listed. No network
+  access is needed for this part,
+- **minus** anything already under `<root>\duplicates`,
+- **plus** the `original_file_location.txt` notes. They didn't exist at scan
+  time and are tiny, so they are hashed fresh.
+
+It has the same columns as the raw listing (`filename, path, mtime, md5,
+size_gb`), so it can replace it anywhere: [`storage_report_by_year.R`](R_plots/storage_report_by_year.R),
+the cross-storage comparison, or `duplicates_check.py --resume-from`.
+
+It can be run before or after deleting `duplicates`; the result is the same.
+Tested against a real rescan after deleting `duplicates`: identical paths,
+md5s, mtimes and sizes.
+
+Caveat: like any raw listing, it is a snapshot of the original scan. Files
+added, changed or deleted on the volume since then (other than by this
+script) are not reflected. Re-run it after an `undo`.
+
+### Progress steps: what each bar is doing
+
+Every step that can take a while shows a live progress bar (or a
+"Loading/Writing …" line for CSV reads and writes, which can't report
+progress). The **Touches the volume** column is what decides speed: local
+steps take seconds to minutes even for millions of rows, while each
+network round trip costs roughly 5–50 ms on a share.
+
+| Command | Bar | What it does | Touches the volume |
+|---|---|---|---|
+| `plan` | Reading keepers from summary | Reads `md5` + `oldest_path` from the summary CSV (one entry per group). | No |
+| `plan` | **Building plan + pre-flight checks** | Per block of 20,000 rows: normalizes each path, checks it's under `--root`, works out its destination, keeper, role and filters (empty, `--min-size`, exclude patterns), then runs the **pre-flight checks** and appends the block to the plan. Pre-flight is one "stat" (an existence + size + modified-time query, no content read) per path involved in a move: every keeper (once per group), every duplicate to move, and every destination (skipped while `duplicates\` doesn't exist yet). Confirms keepers and duplicates still match the scan and that destinations are free; failures become `SKIP` with a reason. With `--no-preflight` the bar is just "Building plan". | Pre-flight: **yes**, about one round trip per keeper + 1–2 per file to move. By far the longest part of `plan` (see below). The rest: no. |
+| `execute` | Validating plan | Checks every plan row's `check` fingerprint and `role` (only `MOVE`↔`SKIP` edits allowed). | No |
+| `execute` | **Moving duplicates** | Per file, on `--workers` threads: stat original + destination, keeper check (once per group), create the destination folder, rename, append the note line, append the journal line. | **Yes**: a few round trips per file. Time depends on file count, not size. |
+| verify | Finding files in duplicates | Walks `<root>\duplicates` folder by folder. | Yes: one listing per folder |
+| verify | Collecting file info | One stat per file found. | Yes |
+| verify | **Hashing duplicates** | Reads every file in `duplicates` to compute its md5. Counts bytes, like duplicates_check.py. | **Yes: reads all the data.** Usually the longest step overall. |
+| verify | Indexing files found | Fingerprints every found path for fast lookup. | No |
+| verify | Comparing with the plan | Matches what was found against the journal by path + md5 and writes the report. | No |
+| `undo` | Restoring files | Per journaled file, on `--workers` threads: stat both locations, rename back. Notes are then rewritten once per folder per block. | Yes |
+| `undo` | Removing empty folders | Deletes mirrored folders in `duplicates` left empty. | Yes, one call per folder |
+| `remaining` | (Reading journals) | Replays the journal and undo journal to know which files are currently moved. | No |
+| `remaining` | Filtering raw listing | Streams the raw listing, dropping moved files (and anything under `duplicates\`). | No |
+| `remaining` | Hashing location notes | Hashes each `original_file_location.txt` (a few KB each). | Yes, one small read per note |
+
+**Why pre-flight is slow, and why it's there.** For Volume A (~60,000 groups,
+~190,000 files to move) it's about 60,000 + 190,000 ≈ 250,000 stats over the
+network on a first run (destinations aren't checked while `duplicates\`
+doesn't exist yet). At 10–40 ms each across 8 threads, that's roughly 5–20
+minutes. For Volume B (~230,000 groups, ~6M files to move) it's ~6M stats, i.e. hours.
+Its purpose is that the plan you review already shows skips caused by files
+that changed or disappeared since the scan. Safety doesn't depend on it:
+`execute` repeats the same checks for each file just before moving it. So
+for a large volume use `--no-preflight`, or raise `--workers` (e.g. 32).
+Shares usually handle many parallel stats well.
+
+**Time for `execute` on a large volume.** Each move takes a few network
+round trips (~4), so 6M moves at ~20 ms per file would take more than a
+day on one thread. With `--workers 16` it's a few hours. Verify then
+re-reads all the moved data, like a duplicates_check.py scan of it.
+
+### Resuming after a crash or kill
+
+Just **run the same `execute` command again**. Each `MOVE` row is decided from
+the files on disk, with the journal as the record:
+
+| original exists | destination exists | what execute does |
+|---|---|---|
+| yes | no | not moved yet → checks and moves it |
+| no | yes, same size/mtime as the scan | already moved (maybe killed before its bookkeeping) → adds the missing note/journal line → `MOVED_RESUMED` / `ALREADY_MOVED` |
+| yes | yes | `CONFLICT`: nothing is touched |
+| no | no | `MISSING` |
+
+The per-file order is **rename → note line → journal line**. The journal is
+flushed after every line, so it survives the process being killed, and
+synced to disk every 2 s (syncing every line would serialize millions of
+moves behind the disk). A kill at any point leaves a state the table above
+recognises. Note and journal lines are never written twice. Ctrl+C stops
+cleanly: moves already in progress finish, and the results so far are kept.
+
+### Skip reasons
+
+| reason | when |
+|---|---|
+| `ZERO_BYTE` | empty file (all empty files share one md5; they're usually placeholders). Always skipped. |
+| `BELOW_MIN_SIZE` | smaller than `--min-size` |
+| `EXCLUDED_PATTERN` | matches an exclude pattern (`detail` says which) |
+| `KEEPER_MISSING` / `KEEPER_CHANGED` / `KEEPER_UNREADABLE` | keeper not found, or its size/mtime differ from the scan → whole group skipped |
+| `DUPLICATE_MISSING` / `DUPLICATE_CHANGED` / `DUPLICATE_UNREADABLE` | same check for the file to move |
+| `DESTINATION_EXISTS` | something is already at the destination path |
+| `IN_DUPLICATES_FOLDER` | a file of the group is already inside `duplicates` |
+| `NO_KEEPER_IN_SUMMARY` / `KEEPER_NOT_IN_LIST` / `NOT_A_DUPLICATE_GROUP` | duplicates and summary CSVs don't agree (e.g. from different runs) |
+
+Keeper and duplicate checks run at `plan` time (so the review shows them,
+unless `--no-preflight`) and **again** right before each move, so a plan
+reviewed days earlier is still safe. mtimes are compared with a **±2 s tolerance**. Some file systems
+(FAT/exFAT, some NAS shares) store mtime only to 2 s, and CSV round trips can
+round it.
+
+### Arguments
+
+| Subcommand | Argument | Description |
+|---|---|---|
+| `plan` | `--duplicates-csv` | `<stem>_folder_duplicates.csv` from `duplicates_check.py --folder`. Required. |
+| | `--summary-csv` | `<stem>_folder_summary.csv` from the same run. Required. |
+| | `--root` | The scanned folder (`--folder` of duplicates_check.py). `duplicates` is created directly under it. Required. |
+| | `--output` | Folder for the plan and, later, all reports. Can't be inside `<root>\duplicates`. Required. |
+| | `--min-size` | Skip duplicates smaller than this: `500KB`, `1MB`, `2GB`, or bytes. Default: 0 (only empty files skipped). |
+| | `--exclude` | Extra wildcard patterns never to move, matched case-insensitively against the file name or full path, e.g. `*.ini "*\Program Files\*"`. Always excluded: `desktop.ini`, `thumbs.db`, `*\.git\*`, `original_file_location.txt`. |
+| | `--no-preflight` | Don't check the files on the volume while planning. Recommended for large volumes; `execute` still checks each file. |
+| | `--workers` | Threads for the pre-flight file checks. Default: 8. |
+| `execute` | `--plan` | The reviewed `move_plan_<timestamp>.csv`. Required. |
+| | `--output` | Folder for journal/reports. Default: the plan's folder. |
+| | `--no-verify` | Don't run verify afterwards. |
+| | `--workers` | Threads for moving files (and for hashing during verify with `--threading`). Default: 8. |
+| | `--threading` | Hash concurrently during verify (as in duplicates_check.py). |
+| `verify` | `--plan`, `--output`, `--threading`, `--workers` | As above. |
+| `undo` | `--plan`, `--output` | As above. |
+| | `--workers` | Threads for restoring files. Default: 8. |
+| `remaining` | `--plan`, `--output` | As above. |
+| | `--raw-csv` | duplicates_check.py's final `<stem>_raw.csv` of the same scan. Default: next to the plan's `--duplicates-csv`. |
+| | `--workers` | Threads for hashing the location notes. Default: 8. |
+| all | `--io-timeout` | Seconds to wait for one filesystem operation (stat, rename, …) before giving up on it. Default: 10. |
+
+### Output files (in `--output`)
+
+| file | written by | content |
+|---|---|---|
+| `move_plan_<ts>.csv` | plan | the plan (see above) |
+| `move_plan_<ts>_settings.json` | plan | root, input CSVs, min size, exclude patterns |
+| `move_plan_<ts>_journal.csv` | execute | one line per completed move, written live |
+| `move_plan_<ts>_execute_results.csv` | execute | outcome per `MOVE` row |
+| `move_plan_<ts>_verify_report.csv` | execute / verify | md5 verification (missing, extra, metadata) |
+| `move_plan_<ts>_undo_journal.csv`, `_undo_results.csv` | undo | restore record and outcome |
+| `move_plan_<ts>_remaining_raw.csv` | remaining | raw listing of what stays after deleting `duplicates` |
+
+### Design decisions
+
+These were agreed before implementation; the reasons are kept here so they
+aren't re-litigated.
+
+- **Move, don't delete.** A quarantine folder makes every mistake reversible
+  until you delete it yourself.
+- **Keeper = oldest copy**, taken from `oldest_path` in duplicates_check.py's
+  summary. Ties (equal mtime) go to the first path alphabetically, as in
+  duplicates_check.py.
+- **Mirrored folder structure** in `duplicates`: no name collisions, the
+  origin is readable from the path, and undo is trivial.
+- **One appended `original_file_location.txt` per source folder**, one line
+  per moved file, rather than one file per moved file.
+- **Keeper check before every move: exists by path/name, same size, same
+  mtime** (±2 s), no re-hash. Fast, and catches a keeper that was deleted,
+  replaced or modified since the scan. If it fails, the whole group stays put.
+- **`os.rename`, not `shutil.move`.** On the same volume both are the same
+  metadata-only operation: milliseconds per file whatever its size, no extra
+  space, fully done or not done. Across volumes, `shutil.move` silently falls
+  back to copy+delete (slow, needs space, can leave half-written files). On
+  Windows `os.rename` also refuses to overwrite. So any cross-volume or
+  name-clash case fails cleanly and is reported as `MOVE_FAILED`.
+- **Dry run first, and execute takes the reviewed plan** (`--plan`), so what
+  runs is exactly what was reviewed. Only `MOVE`↔`SKIP` edits are accepted.
+- **Empty files always skipped**, plus `--min-size` and exclude patterns for
+  small or location-dependent files (configs, `desktop.ini`, `.git`
+  internals). Most of the space is in large files, and small files are the
+  ones most likely to matter where they are.
+- **Folder-mode input only.** The script refuses any path outside `--root`.
+  Origin↔destination output (`between_summary`) lists a file and its *backup*
+  and must never be "deduplicated".
+- **Verification by expected path + md5**, not md5 alone.
+- **Long paths are moved, and flagged.** Moving into `\duplicates\` adds 11
+  characters, so a source path near Windows' 260-character limit (MAX_PATH)
+  can end up over it. All filesystem calls use the `\\?\` extended-path form,
+  which lifts that limit regardless of the system's `LongPathsEnabled`
+  setting. Such rows have `long_path = True` in every report. Some tools
+  (older Explorer, some backup software) may not open them. A failure is
+  reported as `MOVE_FAILED`, for example a server-side path limit or a single
+  path segment over 255 characters.
+- **Resume from disk state + journal** (see *Resuming*). Live journal,
+  flushed per line, synced to disk every 2 s.
+- **Built for millions of files on an 8 GB machine.** No command loads a
+  whole CSV. The duplicates CSV, plan, journal and raw listing are all
+  streamed in blocks of 20,000 rows, small enough that every progress bar
+  moves at least about once a second. This relies on duplicates_check.py writing
+  the duplicates CSV sorted by md5, so each block holds whole groups; a file
+  that isn't is refused. Sets of millions of paths (moved files, files found
+  in `duplicates`) are kept as 8-byte fingerprints in sorted arrays instead
+  of ~300-byte strings. The chance of two paths sharing a fingerprint is
+  about 1 in a million at 6M paths. Moves and restores run on `--workers`
+  threads, because one at a time would take days at that scale. The only
+  step that holds a whole list is verify's scan of `duplicates`, the same
+  scan duplicates_check.py does.
+- **Reports go to `--output`**, never inside `duplicates` (they would
+  otherwise show up as `EXTRA` in their own verification).
+- **Not handled:** several plans moving into the same `duplicates` folder.
+  Each verify only knows its own plan's journal, so files from an earlier
+  plan show up as `EXTRA`.
+- **Sync interaction not handled:** this targets an independent backup
+  storage, not a root that is mirrored by a sync job.
+
+### Notes
+
+- **Long paths end to end:** duplicates_check.py uses the same `\\?\`
+  handling (the shared `to_long_path` helper lives there), so files deeper
+  than 260 characters are scanned, grouped and can be quarantined. Still
+  check its `skipped_folders.csv`: folders can be skipped for other reasons
+  (permissions, timeouts), and their files never reach this script.
+- Every filesystem operation has a timeout (`--io-timeout`), as in
+  duplicates_check.py, so an unreachable share or stuck handle is reported
+  instead of hanging the run. A rename that times out is reported as
+  `MOVE_TIMEOUT`. Re-running `execute` finds out whether it completed.
+- The `duplicates` folder and the notes are ordinary files: deleting
+  `duplicates` frees the space, and the notes stay as a record of where each
+  file's surviving copy is.
