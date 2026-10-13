@@ -81,6 +81,8 @@ JOURNAL_COLUMNS = [
     "original_path", "duplicates_path", "keeper_path",
 ]
 MOVED_STATUSES = {"MOVED", "MOVED_RESUMED"}
+RETRY_STATUSES = {"ERROR", "MOVE_FAILED", "MOVE_TIMEOUT"}  # what execute --retry-failed tries again
+RETRY_RESULTS_SUFFIX = "__movedFailed"
 EXECUTE_RESULT_COLUMNS = [
     "status", "detail", "md5", "size_bytes", "modified",
     "original_path", "duplicates_path", "keeper_path", "long_path",
@@ -583,6 +585,36 @@ def output_prefix(plan_path: Path, output: str | None) -> Path:
     return folder / plan_path.stem
 
 
+def execute_results_path(prefix: Path, retry_failed: bool = False) -> Path:
+    """<prefix>_execute_results.csv, or its __movedFailed twin for --retry-failed runs."""
+    return Path(f"{prefix}_execute_results{RETRY_RESULTS_SUFFIX if retry_failed else ''}.csv")
+
+
+def execute_outcomes(prefix: Path, keep: Callable[[str], bool]) -> dict[int, tuple[str, str]]:
+    """
+    Latest execute outcome per file whose status passes `keep`, as path
+    fingerprint -> (status, detail). A full run's results cover every MOVE
+    row; a --retry-failed run's results cover only the rows it retried and
+    override the full run's, unless a full run was made after them.
+    """
+    full, retry = execute_results_path(prefix), execute_results_path(prefix, retry_failed=True)
+    if not full.exists():
+        return {}
+    outcomes: dict[int, tuple[str, str]] = {}
+    for chunk in iter_csv(full, ["status", "detail", "original_path"]):
+        chunk = chunk[chunk["status"].map(keep)]
+        for status, detail, path in zip(chunk["status"], chunk["detail"], chunk["original_path"]):
+            outcomes[path_hash(path)] = (status, detail)
+    if retry.exists() and retry.stat().st_mtime > full.stat().st_mtime:
+        for chunk in iter_csv(retry, ["status", "detail", "original_path"]):
+            for status, detail, path in zip(chunk["status"], chunk["detail"], chunk["original_path"]):
+                if keep(status):
+                    outcomes[path_hash(path)] = (status, detail)
+                else:
+                    outcomes.pop(path_hash(path), None)
+    return outcomes
+
+
 def check_output_folder(output: str | Path, duplicates_dir: str) -> None:
     if _is_under(str(output), duplicates_dir):
         raise SystemExit(
@@ -864,6 +896,18 @@ def cmd_execute(args: argparse.Namespace) -> None:
     timeout = args.io_timeout
 
     total_moves = validate_plan(plan_path)
+    retry_keys = None
+    if args.retry_failed:
+        if not execute_results_path(prefix).exists():
+            raise SystemExit(f"ERROR: no '{execute_results_path(prefix)}' to retry from; run execute without --retry-failed first.")
+        failed = execute_outcomes(prefix, lambda status: status in RETRY_STATUSES)
+        if not failed:
+            print(f"Nothing to retry: no {', '.join(sorted(RETRY_STATUSES))} in the latest execute results.")
+            return
+        retry_keys = np.fromiter(failed, dtype=np.uint64, count=len(failed))
+        total_moves = len(failed)
+        print(f"Retrying {total_moves} file(s) that failed ({', '.join(sorted(RETRY_STATUSES))}) in the latest execute results")
+        del failed
     moved = moved_now(prefix)
     if len(moved):
         print(f"Resuming: {len(moved)} file(s) already recorded as moved in {journal_path(prefix)}")
@@ -878,7 +922,7 @@ def cmd_execute(args: argparse.Namespace) -> None:
     keeper_checks: dict[str, tuple[str, str] | None] = {}
     created_dirs: set[int] = set()
     counts: Counter = Counter()
-    results_path = Path(f"{prefix}_execute_results.csv")
+    results_path = execute_results_path(prefix, args.retry_failed)
 
     with CsvAppender(journal_path(prefix), JOURNAL_COLUMNS, append=True, durable=True) as journal, \
             CsvAppender(results_path, EXECUTE_RESULT_COLUMNS, append=False) as results:
@@ -964,7 +1008,10 @@ def cmd_execute(args: argparse.Namespace) -> None:
         try:
             with tqdm(total=total_moves, desc="Moving duplicates", unit="file") as progress:
                 for chunk in iter_plan(plan_path):
-                    rows = list(chunk[chunk["action"] == "MOVE"].itertuples(index=False))
+                    chunk = chunk[chunk["action"] == "MOVE"]
+                    if retry_keys is not None:
+                        chunk = chunk[np.isin(hash_array(chunk["original_path"], len(chunk)), retry_keys)]
+                    rows = list(chunk.itertuples(index=False))
                     del chunk
                     for status in _bounded_map(executor, _process, rows, args.workers * 64):
                         counts[status] += 1
@@ -988,7 +1035,11 @@ def cmd_execute(args: argparse.Namespace) -> None:
         )
     del moved, created_dirs
     gc.collect()
-    if not args.no_verify:
+    if args.no_verify:
+        return
+    if retry_keys is not None:
+        run_verify_retried(plan_path, prefix, retry_keys, args)
+    else:
         run_verify(plan_path, settings, prefix, args)
 
 
@@ -1009,13 +1060,12 @@ def run_verify(plan_path: Path, settings: dict, prefix: Path, args: argparse.Nam
 
     # Outcomes of MOVE rows that weren't moved, for the NOT_MOVED detail.
     # Only these are kept: the results file has a row for every move.
-    not_moved: dict[int, str] = {}
-    results_path = Path(f"{prefix}_execute_results.csv")
-    if results_path.exists():
-        for chunk in iter_csv(results_path, ["status", "detail", "original_path"]):
-            chunk = chunk[~chunk["status"].isin(MOVED_STATUSES | {"ALREADY_MOVED"})]
-            for status, detail, path in zip(chunk["status"], chunk["detail"], chunk["original_path"]):
-                not_moved[path_hash(path)] = f"{status}: {detail}" if detail else status
+    not_moved = {
+        key: f"{status}: {detail}" if detail else status
+        for key, (status, detail) in execute_outcomes(
+            prefix, lambda status: status not in MOVED_STATUSES | {"ALREADY_MOVED"}
+        ).items()
+    }
 
     print(f"\nVerifying: re-hashing every file under '{duplicates_dir}' ...")
     found_paths = np.zeros(0, dtype=object)
@@ -1103,6 +1153,70 @@ def run_verify(plan_path: Path, settings: dict, prefix: Path, args: argparse.Nam
         print(f"{problems} row(s) need attention - see the report.")
     else:
         print("All recorded moves are present in the duplicates folder with the expected md5.")
+    print(f"Verify report: {report_path}")
+
+
+def run_verify_retried(plan_path: Path, prefix: Path, retry_keys: np.ndarray, args: argparse.Namespace) -> None:
+    """
+    Verify only the rows an execute --retry-failed run retried: hash each
+    one's destination directly instead of re-hashing the whole duplicates
+    folder. Same statuses as run_verify, minus the folder-wide ones (EXTRA,
+    UNSCANNED_FOLDER); written to <prefix>_verify_report__movedFailed.csv,
+    leaving the full verify report untouched.
+    """
+    moved = moved_now(prefix)
+    not_moved = {
+        key: f"{status}: {detail}" if detail else status
+        for key, (status, detail) in execute_outcomes(
+            prefix, lambda status: status not in MOVED_STATUSES | {"ALREADY_MOVED"}
+        ).items()
+    }
+    timeout = args.io_timeout
+
+    def _check(row) -> list:
+        dst = probe(row.duplicates_path, timeout)
+        found = ["", "", ""] if dst[0] != "exists" else [dst[1], _fmt_mtime(dst[2]), ""]
+        if path_hash(row.original_path) not in moved:
+            if dst[0] == "exists":
+                return ["MOVED_NOT_JOURNALED", "found but not in the journal; re-run execute to finish its bookkeeping", found]
+            return ["NOT_MOVED", not_moved.get(path_hash(row.original_path), "NOT_EXECUTED"), found]
+        if dst[0] == "missing":
+            return ["MISSING", "recorded as moved but not found in the duplicates folder", found]
+        if dst[0] == "error":
+            return ["UNREADABLE", dst[3], found]
+        md5 = calculate_md5(to_long_path(row.duplicates_path), timeout=timeout)
+        found[2] = md5 or ""
+        if not md5:
+            return ["UNREADABLE", "found but could not be hashed", found]
+        if md5 != row.md5:
+            return ["MD5_MISMATCH", "content differs from the scanned duplicate", found]
+        return ["OK", "", found]
+
+    counts: Counter = Counter()
+    report_path = Path(f"{prefix}_verify_report{RETRY_RESULTS_SUFFIX}.csv")
+    print(f"\nVerifying the {len(retry_keys)} retried file(s) only ...")
+    with CsvAppender(report_path, VERIFY_COLUMNS, append=False) as report, \
+            ThreadPoolExecutor(max_workers=args.workers) as executor, \
+            tqdm(total=len(retry_keys), desc="Verifying retried files", unit="file") as progress:
+        for chunk in iter_plan(plan_path):
+            chunk = chunk[chunk["action"] == "MOVE"]
+            rows = list(chunk[np.isin(hash_array(chunk["original_path"], len(chunk)), retry_keys)].itertuples(index=False))
+            for row, (status, detail, (size_found, mtime_found, md5_found)) in zip(
+                rows, _bounded_map(executor, _check, rows, args.workers * 64)
+            ):
+                report.append([
+                    status, detail, row.md5, md5_found, row.original_path, row.duplicates_path,
+                    row.keeper_path, row.size_bytes, size_found, row.modified, mtime_found, row.long_path,
+                ])
+                counts[status] += 1
+                progress.update(1)
+
+    _print_counts("Verify (retried files)", counts, "Nothing to verify.")
+    problems = sum(counts[s] for s in ("MISSING", "MD5_MISMATCH", "UNREADABLE", "MOVED_NOT_JOURNALED"))
+    if problems:
+        print(f"{problems} row(s) need attention - see the report.")
+    else:
+        print("All retried files that were moved are in the duplicates folder with the expected md5.")
     print(f"Verify report: {report_path}")
 
 
@@ -1385,6 +1499,12 @@ def parse_args() -> argparse.Namespace:
     execute.add_argument("--plan", required=True, help="The move_plan_<timestamp>.csv written by 'plan'.")
     execute.add_argument("--output", help="Folder for journal/reports. Default: the plan's folder.")
     execute.add_argument("--no-verify", action="store_true", help="Skip the md5 verification after moving.")
+    execute.add_argument(
+        "--retry-failed", action="store_true",
+        help=f"Only retry the files whose latest execute result is {', '.join(sorted(RETRY_STATUSES))}; "
+             f"results go to <plan>_execute_results{RETRY_RESULTS_SUFFIX}.csv, leaving the full run's untouched. "
+             f"Verify then checks only those files (<plan>_verify_report{RETRY_RESULTS_SUFFIX}.csv).",
+    )
     _threading(execute)
     _common(execute, "Threads for moving files (and for hashing during verify with --threading).")
 

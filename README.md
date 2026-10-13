@@ -905,6 +905,43 @@ It does the following:
 4. Writes `<plan>_execute_results.csv` (one row per `MOVE` row).
 5. Runs **verify** (step 3 below), unless `--no-verify` is given.
 
+**Retrying only the failed files.** Re-running the same command retries
+everything that isn't moved yet, but it checks every `MOVE` row on disk again,
+which is slow on a large volume. To retry only the files whose latest result is
+`ERROR`, `MOVE_FAILED` or `MOVE_TIMEOUT`, add `--retry-failed`:
+
+```powershell
+python quarantine_duplicates.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --retry-failed
+```
+
+The same checks are run on each retried file. Its results go to
+`<plan>_execute_results__movedFailed.csv`, so the full run's
+`_execute_results.csv` is kept. Running `--retry-failed` again retries what
+still failed (the retry file overrides the full run's results, unless a full run
+was made after it). `CONFLICT`, `MISSING` and `SKIPPED_*` are not retried: look
+at those first.
+
+**Re-running files after resolving them by hand.** `--retry-failed` doesn't
+pick these up, since retrying them unchanged only gives the same result again.
+Once they're resolved, run `execute` **without** `--retry-failed`. That re-checks
+every row (the slow path), and each file still goes through all the checks, so
+nothing unresolved is touched:
+
+| status (detail) | how to resolve it | what the next `execute` does |
+|---|---|---|
+| `CONFLICT` (*both the original and a file at the destination exist*) | Remove or rename the file at the destination (left over from an earlier run or a manual copy). | Moves it as usual → `MOVED`. |
+| | Or, if the destination copy is the right one, delete the original. | The destination matches the scan → `MOVED_RESUMED`. |
+| `CONFLICT` (*original is gone and the file at the destination differs from the scan*) | The file was changed after the move; a re-run reports it as `CONFLICT` again. Decide by hand: move it back and make a new plan, or accept it as is (it stays out of the journal). | `CONFLICT` again. |
+| `MISSING` | Put the original back. | Moves it as usual → `MOVED`. |
+| `SKIPPED_*` | The keeper or the duplicate changed since the scan; the checks compare against the scan, so they're skipped again. | Re-scan with duplicates_check.py and make a new plan. |
+
+Verify then checks only the retried files: it hashes each one at its
+destination instead of re-hashing the whole duplicates folder, and writes
+`<plan>_verify_report__movedFailed.csv` (same statuses as the full report,
+without the folder-wide `EXTRA` and `UNSCANNED_FOLDER`). The full
+`_verify_report.csv` is left as it was. Run `verify` on its own for a complete
+check of the folder.
+
 #### 3. Verify
 
 Runs automatically after `execute`. Run it alone with:
@@ -1086,6 +1123,7 @@ round it.
 | `execute` | `--plan` | The reviewed `move_plan_<timestamp>.csv`. Required. |
 | | `--output` | Folder for journal/reports. Default: the plan's folder. |
 | | `--no-verify` | Don't run verify afterwards. |
+| | `--retry-failed` | Only retry the files whose latest result is `ERROR`, `MOVE_FAILED` or `MOVE_TIMEOUT`; results go to `_execute_results__movedFailed.csv`, and verify checks only those files (`_verify_report__movedFailed.csv`). |
 | | `--workers` | Threads for moving files (and for hashing during verify with `--threading`). Default: 8. |
 | | `--threading` | Hash concurrently during verify (as in duplicates_check.py). |
 | `verify` | `--plan`, `--output`, `--threading`, `--workers` | As above. |
@@ -1104,6 +1142,8 @@ round it.
 | `move_plan_<ts>_settings.json` | plan | root, input CSVs, min size, exclude patterns |
 | `move_plan_<ts>_journal.csv` | execute | one line per completed move, written live |
 | `move_plan_<ts>_execute_results.csv` | execute | outcome per `MOVE` row |
+| `move_plan_<ts>_execute_results__movedFailed.csv` | execute `--retry-failed` | outcome per retried row |
+| `move_plan_<ts>_verify_report__movedFailed.csv` | execute `--retry-failed` | md5 verification of the retried rows only |
 | `move_plan_<ts>_verify_report.csv` | execute / verify | md5 verification (missing, extra, metadata) |
 | `move_plan_<ts>_undo_journal.csv`, `_undo_results.csv` | undo | restore record and outcome |
 | `move_plan_<ts>_remaining_raw.csv` | remaining | raw listing of what stays after deleting `duplicates` |
