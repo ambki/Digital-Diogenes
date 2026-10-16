@@ -1,14 +1,16 @@
 # Digital-Diogenes
 
 Tools for finding, verifying and cleaning up duplicate and obsolete files on
-large storage volumes. The repository contains three Python scripts, each
-documented in its own section below, in the order they are used:
+large storage volumes. The repository contains three Python scripts for the
+pipeline and one standalone helper, each documented in its own section
+below, in the order they are used:
 
 | Step | Script | Purpose |
 |---|---|---|
 | 1. Analyse | [`duplicates_check.py`](#duplicates_checkpy) | Scans one or two folders for duplicate files (by MD5) and verifies backups against their source. |
 | 1. Analyse | [`elimination_file_candidates.py`](#elimination_file_candidatespy) | Scans a folder for files that are candidates for elimination (old files, ZIP files, files in `Unmixed` folders). Independent of `duplicates_check.py`, but run at the same step: it also gives insight into the data before anything is eliminated. |
 | 2. Clean up | [`quarantine_duplicates.py`](#quarantine_duplicatespy) | Uses the duplicate list from `duplicates_check.py --folder` to move every copy but the oldest into a reversible `duplicates` quarantine folder. |
+| When needed | [`change_folder_permissions.py`](#change_folder_permissionspy) | Standalone, run by hand: gives an account Modify on a folder tree (e.g. when `execute` fails with *Access is denied*), later reduces everyone else to read only, and restores the previous permissions. |
 
 The R scripts used for reporting live in [`R_plots/`](R_plots/), and the
 scripts that generate test data live in [`support_scripts/`](support_scripts/).
@@ -47,6 +49,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
   - [Output files (in `--output`)](#output-files-in---output)
   - [Design decisions](#design-decisions)
   - [Notes](#notes-2)
+- [change_folder_permissions.py](#change_folder_permissionspy)
 
 ---
 
@@ -919,7 +922,9 @@ The same checks are run on each retried file. Its results go to
 `_execute_results.csv` is kept. Running `--retry-failed` again retries what
 still failed (the retry file overrides the full run's results, unless a full run
 was made after it). `CONFLICT`, `MISSING` and `SKIPPED_*` are not retried: look
-at those first.
+at those first. For `MOVE_FAILED` with `[WinError 5] Access is denied`, give
+yourself Modify on that folder first with
+[`change_folder_permissions.py grant`](#change_folder_permissionspy).
 
 **Re-running files after resolving them by hand.** `--retry-failed` doesn't
 pick these up, since retrying them unchanged only gives the same result again.
@@ -1225,3 +1230,74 @@ aren't re-litigated.
 - The `duplicates` folder and the notes are ordinary files: deleting
   `duplicates` frees the space, and the notes stay as a record of where each
   file's surviving copy is.
+
+---
+
+## change_folder_permissions.py
+
+A standalone helper, not part of the pipeline: run it by hand when needed.
+Typical case: `quarantine_duplicates.py execute` reports `MOVE_FAILED` with
+`[WinError 5] Access is denied` for a folder and its subfolders, because the
+account can read there but not delete or rename. It has three steps, each
+run on its own:
+
+| Step | What it does |
+|---|---|
+| `grant <folder>` | Gives the account **Modify** on the folder and everything under it: one inheritable entry on the folder, plus one on every item that doesn't inherit it (folders with inheritance switched off). Items whose permissions can't be read or changed go to the errors file. `--take-ownership`: for those (*Access is denied*), take ownership for the account and try again; the original owner is recorded. |
+| `lockdown <folder>` | Every user or group with write access keeps **read only**: on the folder (which stops inheriting from above, so write access given higher up is reduced too) and on every item with entries of its own. The account (with Modify), SYSTEM and Administrators keep their rights. No *Everyone* entry is added and no Deny entries are used. `--exclude NAME_OR_PATH` (repeatable) leaves a folder and its contents as they are, e.g. where instruments still write. |
+| `restore <changes.csv>` | Puts back the permissions from before a `grant` or `lockdown` run, from the changes file it wrote. To undo both, restore the lockdown first, then the grant. |
+
+```powershell
+# 1. Modify for you on the folder that failed, then retry the moves
+python change_folder_permissions.py grant "\\server\share\data\problem_folder" --dry-run
+python change_folder_permissions.py grant "\\server\share\data\problem_folder"
+python quarantine_duplicates.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --retry-failed
+
+# 2. Later, once you decide: read only for everyone else
+python change_folder_permissions.py lockdown "\\server\share\data" --exclude "\\server\share\data\instrument_backups"
+
+# Undo a step
+python change_folder_permissions.py restore permissions_lockdown_20261016_101500_changes.csv
+```
+
+**The account.** By default it's you. `--account` takes `DOMAIN\user`,
+`user@domain`, an email address (looked up in Active Directory if it's not
+the sign-in name) or a SID; `--account-from PATH` uses the owner of a file or
+folder. On a network share, the file server may know an account by another
+ID than your PC: on a PC signed in with a cloud (Entra ID) account, this PC
+sees an `S-1-12-...` ID, while a file server in the on-premises domain knows
+the same person as `S-1-5-21-...`, and a grant to the first wouldn't apply
+there. The script warns about this; use `--account-from` with a folder you
+created on that share (e.g. the `duplicates` folder made by `execute`) to
+get the server's ID.
+
+**Output files** (in `--output`, default: the current folder; never inside
+the folder being changed):
+
+| file | content |
+|---|---|
+| `permissions_<step>_<timestamp>_changes.csv` | every item changed: `path`, `type`, `owner_before`, `owner_after`, `dacl_before`, `dacl_after` (permissions as SDDL). Written before each change, so even a killed run can be restored. `restore` reads this file. |
+| `permissions_<step>_<timestamp>_errors.csv` | every item that couldn't be listed, read or changed: `timestamp`, `step`, `path`, `operation`, `error_code`, `message` (the Windows error) |
+
+`--dry-run` writes the changes file as `..._dryrun_changes.csv` and changes
+nothing. Each step asks for confirmation (`--yes` skips it).
+
+**Notes**
+
+- Permissions are read and written with the Windows security API (the one
+  `icacls` uses), so it works the same whatever the Windows language, and
+  long paths (`\\?\`) work.
+- After `grant`/`lockdown` on the folder itself, Windows passes the change
+  on to everything that inherits from it. On a large tree that takes a
+  while, without progress shown.
+- Changing permissions needs *Change permissions* on the item or being its
+  owner, and taking ownership needs admin rights on the file server. What
+  still fails stays in the errors file. A retention or archive lock on the
+  storage can't be lifted with permissions; that's for the storage admin.
+- The share's own permissions (on the share, not on its files) also apply,
+  and the stricter of the two wins. If the share gives you read only, no
+  file permission helps.
+- An item with no permissions set at all (everyone has full access) isn't
+  changed by `lockdown`; it's listed in the errors file to set by hand.
+- Owners of files can always change those files' permissions, so a user
+  could give themselves write access back on files they own.
