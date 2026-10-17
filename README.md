@@ -1,8 +1,9 @@
 # Digital-Diogenes
 
 Tools for finding, verifying and cleaning up duplicate and obsolete files on
-large storage volumes. The repository contains three Python scripts for the
-pipeline and one standalone helper, each documented in its own section
+large storage volumes, and for moving old files off to a cheaper tape archive.
+The repository contains four Python scripts for the pipeline and one
+standalone helper, each documented in its own section
 below, in the order they are used:
 
 | Step | Script | Purpose |
@@ -10,6 +11,7 @@ below, in the order they are used:
 | 1. Analyse | [`duplicates_check.py`](#duplicates_checkpy) | Scans one or two folders for duplicate files (by MD5) and verifies backups against their source. |
 | 1. Analyse | [`elimination_file_candidates.py`](#elimination_file_candidatespy) | Scans a folder for files that are candidates for elimination (old files, ZIP files, files in `Unmixed` folders). Independent of `duplicates_check.py`, but run at the same step: it also gives insight into the data before anything is eliminated. |
 | 2. Clean up | [`quarantine_duplicates.py`](#quarantine_duplicatespy) | Uses the duplicate list from `duplicates_check.py --folder` to move every copy but the oldest into a reversible `duplicates` quarantine folder. |
+| 3. Archive | [`archive_old_files.py`](#archive_old_filespy) | Moves the files modified in a date range into a `move_to_archive` folder (same folder structure), ready to be copied to tape by hand. Scans the storage itself, or reuses the newest raw listing. |
 | When needed | [`change_folder_permissions.py`](#change_folder_permissionspy) | Standalone, run by hand: gives an account Modify on a folder tree (e.g. when `execute` fails with *Access is denied*), later reduces everyone else to read only, and restores the previous permissions. |
 
 The R scripts used for reporting live in [`R_plots/`](R_plots/), and the
@@ -49,6 +51,18 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
   - [Output files (in `--output`)](#output-files-in---output)
   - [Design decisions](#design-decisions)
   - [Notes](#notes-2)
+- [archive_old_files.py](#archive_old_filespy)
+  - [Workflow at a glance](#workflow-at-a-glance-1)
+  - [What happens to the files and folders](#what-happens-to-the-files-and-folders)
+  - [Notes: where every file went](#notes-where-every-file-went)
+  - [Requirements](#requirements-3)
+  - [Input: which listing to use](#input-which-listing-to-use)
+  - [Usage](#usage-3)
+  - [Skip reasons and statuses](#skip-reasons-and-statuses)
+  - [Arguments](#arguments-3)
+  - [Output files](#output-files)
+  - [Generating test data](#generating-test-data-2)
+  - [Design decisions](#design-decisions-1)
 - [change_folder_permissions.py](#change_folder_permissionspy)
 
 ---
@@ -1230,6 +1244,375 @@ aren't re-litigated.
 - The `duplicates` folder and the notes are ordinary files: deleting
   `duplicates` frees the space, and the notes stay as a record of where each
   file's surviving copy is.
+
+---
+
+## archive_old_files.py
+
+Isolates old files so they can be moved from an active (expensive) storage to
+a tape (cheaper) archive. Every file whose **modification time** falls in a
+date range is moved into a `move_to_archive` folder under the same storage
+root, with **exactly the same folder structure**. Files outside the range stay
+where they are, untouched. The script never writes to tape: you copy
+`move_to_archive` to tape yourself, check it against the manifest, and delete
+it.
+
+It works like [`quarantine_duplicates.py`](#quarantine_duplicatespy), with the
+same safety mechanisms: a reviewable dry-run plan, `MOVE`↔`SKIP` as the only
+allowed edit, a journal, resume after a crash, `--retry-failed`, verify by md5,
+and `undo`.
+
+### Workflow at a glance
+
+```
+archive_old_files.py plan     → (scans + hashes the storage, unless --raw-csv is given)
+                              → archive_plan_<timestamp>.csv  (dry run, review it)
+archive_old_files.py execute  → moves, notes, removes emptied folders, manifest, root index,
+                                then verify and <plan>_remaining_raw.csv
+   (copy move_to_archive to tape, check it with archive_manifest.csv, delete move_to_archive)
+archive_old_files.py verify   → (optional) re-run the md5 check alone
+archive_old_files.py undo     → (optional) put everything back
+```
+
+The archive step is self-contained: without `--raw-csv`, `plan` scans and
+hashes the storage itself (the same scan as `duplicates_check.py --folder`).
+With `--raw-csv` it reuses an existing listing and plans in minutes, so you
+can try several date ranges or categories against one scan.
+
+### What happens to the files and folders
+
+For `R:\P\a.tif` (2010), `R:\P\b.tif` (2024) and `R:\P\old\c.tif` (2009),
+with `--before 2016-01-01`:
+
+- `R:\P\a.tif` → `R:\move_to_archive\P\a.tif`
+- `R:\P\old\c.tif` → `R:\move_to_archive\P\old\c.tif`
+- `R:\P\b.tif` stays.
+- `R:\P\old` is now empty, so it is **removed** from the storage.
+- `R:\P` keeps `b.tif` and gets an `archived_files_location.txt` note (see below).
+
+**Folders emptied by the run are removed**, together with parents that become
+empty. A folder counts as empty when only notes and system files are left in
+it (`archived_files_location.txt`, `original_file_location.txt`,
+`desktop.ini`, `thumbs.db`). Those then **move along with the folder**
+(reason `FOLLOWS_FOLDER`), whatever their date, so no folder is left holding
+only text files. This includes folders that held nothing but a quarantine note
+before this run (every file in them was a quarantined duplicate). Folders that
+were already completely empty before the run are left alone. Removal uses
+`rmdir`, which only succeeds on a really empty folder, so a folder that still
+holds anything is never removed (`FOLDER_KEPT`).
+
+Two exceptions:
+
+- **A `.git` folder only moves whole.** If only some of its files fall in the
+  range, none of them move (`GIT_PARTIAL`), since moving part of a repository
+  breaks it.
+- **A quarantine that isn't finalized.** While `<root>\duplicates` exists,
+  `quarantine_duplicates.py undo` is still possible, so folders holding a
+  quarantine note are kept (`QUARANTINE_NOT_FINALIZED`). Delete `duplicates`
+  first and plan again to include them.
+
+`<root>\duplicates` and `<root>\move_to_archive` are never archived.
+
+### Notes: where every file went
+
+Every note line names the **archive label** (the tape) and the path inside
+`move_to_archive`, and ends with the plan it came from. A user on the storage,
+and a user restoring from tape, can both find where a file went.
+
+| Where | File | What it holds |
+|---|---|---|
+| Every folder in `move_to_archive` | `archived_files_location.txt` | one line per file in that folder: original path, label, archive path, md5, size, modified |
+| Every folder on the storage that lost files but still exists | `archived_files_location.txt` | the same lines, plus one `removed_folder` line per subfolder that was removed |
+| `move_to_archive\archive_manifest.csv` | manifest, goes to tape | every file of the batch, one row each with all its metadata |
+| `<root>\_archived_to_tape.csv` | root index, stays on the storage | every file and removed folder of every batch (cumulative) |
+| Quarantine notes (`original_file_location.txt`) | a `keeper_archived` line | added when the keeper they point at is archived, so the pointer doesn't go stale |
+
+```
+moved_file: a.tif | original_path: R:\P\a.tif | archive_label: LTO-0042 | archive_path: move_to_archive\P\a.tif | md5: a3f… | size_bytes: 1234 | modified: 2010-06-01 10:00:00 | archived_on: 2026-10-20 10:15:00 | plan: archive_plan_20261020_101500
+removed_folder: R:\P\old | reason: all files archived | archive_label: LTO-0042 | archive_path: move_to_archive\P\old | archived_on: 2026-10-20 10:15:00 | plan: archive_plan_20261020_101500
+keeper_archived: R:\A\scan.tif | archive_label: LTO-0042 | archive_path: move_to_archive\A\scan.tif | archived_on: 2026-10-20 10:15:00 | plan: archive_plan_20261020_101500
+```
+
+**Notes move with their folder, also in later runs.** A note is never
+selected by its date. It only moves when its folder ends up holding nothing
+but notes and system files. It then goes to the archive side and is merged
+with the note this run wrote there, so the copy on tape carries the folder's
+whole history. Example over two runs:
+
+1. **Run 1 (`--archive-label LTO-0001`):** `F\x.tif` and `F\y.tif` are
+   archived. `F\z.tif` (recent) stays, so `F` keeps a note with two lines
+   pointing to `LTO-0001`.
+2. **Run 2, years later (`LTO-0007`):** `z.tif` is archived, leaving `F`
+   with only its note. The note moves to `move_to_archive\F\`, the `z.tif`
+   line is added, and `F` is removed. Its parent gets a `removed_folder: F |
+   archive_label: LTO-0007` line.
+
+On tape `LTO-0007`, `F\archived_files_location.txt` then reads:
+
+```
+moved_file: x.tif | … | archive_label: LTO-0001 | archive_path: move_to_archive\F\x.tif | …
+moved_file: y.tif | … | archive_label: LTO-0001 | archive_path: move_to_archive\F\y.tif | …
+moved_file: z.tif | … | archive_label: LTO-0007 | archive_path: move_to_archive\F\z.tif | …
+```
+
+Someone restoring `F` from `LTO-0007` learns that the rest of the folder is
+on `LTO-0001`. Deleting the note instead would lose that link.
+
+### Requirements
+
+- Python 3.10+
+- `pandas`, `numpy`, `tqdm`
+
+**`archive_old_files.py` imports helpers from `duplicates_check.py` (the
+scan) and `quarantine_duplicates.py` (journal, CSV streaming, file checks),
+so all three files must stay in the same folder.** You don't have to *run*
+either of the other two. If one is missing, the script stops at startup and
+names it.
+
+### Input: which listing to use
+
+Without `--raw-csv`, `plan` scans and hashes `--root` itself and writes
+`archive_scan_<timestamp>_raw.csv` into `--output`. With `--raw-csv`, always
+pass the **newest listing of the storage**:
+
+| What happened last on the storage | Listing to pass |
+|---|---|
+| nothing, or only a scan | `duplicates_check.py`'s `<stem>_raw.csv`, or nothing (let `plan` scan) |
+| a quarantine was executed | `quarantine_duplicates.py`'s `<plan>_remaining_raw.csv` |
+| an earlier archive was executed | this script's `<plan>_remaining_raw.csv` |
+
+An outdated listing can't do damage: files that no longer exist are skipped
+(`FILE_MISSING`), and `plan` warns when that's more than a few percent. The
+listing's paths must be under `--root` in the same spelling (`R:\` and
+`\\server\share\` count as different), as in `quarantine_duplicates.py`.
+
+If the scan of `plan` is interrupted during hashing, the pre-hash listing it
+already wrote can be resumed with `duplicates_check.py --folder <root> --excel
+<x> --resume-from <listing>`, and its final `_raw.csv` passed as `--raw-csv`.
+
+**Categories** (`--categories`, required) are worked out from the listing's
+own md5 column, so every listing above works:
+
+| Category | Meaning |
+|---|---|
+| `all` | every file in the date range (the only choice for a listing without md5) |
+| `unique` | its md5 occurs once on the storage |
+| `keeper` | the oldest copy of a duplicate group (ties: first path alphabetically, as in duplicates_check.py) |
+| `duplicate` | the other copies |
+| `unreadable` | no md5 (couldn't be hashed) |
+
+Categories describe the storage as listed. After a quarantine, a former keeper
+has no copies left, so it counts as `unique`. Archiving `keeper` while its
+`duplicate` copies stay active is allowed; their quarantine notes get the
+`keeper_archived` line.
+
+### Usage
+
+Run from the repository root.
+
+#### 1. Plan (dry run, moves nothing)
+
+```powershell
+python archive_old_files.py plan `
+    --root   "R:\" `
+    --output "C:\reports\archive" `
+    --before 2016-01-01 `
+    --categories unique keeper `
+    --archive-label LTO-0042
+```
+
+Add `--raw-csv <listing>` to skip the scan. Use `--from 2010-01-01 --to
+2016-01-01` instead of `--before` for a window. Dates are **UTC**, like the
+mtimes in every listing. `--before` excludes the date itself. `--from`
+includes its date and `--to` excludes its date.
+
+The summary shows the files to move per year, per category and per top
+folder (two levels under the root), the skips, the folders that will be
+removed, and the quarantine notes to update. Re-run `plan --raw-csv …` with
+other dates for free.
+
+The plan has one row per file in the date range (plus files with an
+unknown mtime), then one row per note/system file following its folder, per
+quarantine note to update, and per folder to remove:
+
+| column | meaning |
+|---|---|
+| `action` | `MOVE` or `SKIP` |
+| `reason`, `detail` | why (`DATE_RANGE`, `FOLLOWS_FOLDER`, `FOLDER_EMPTIED`, `KEEPER_ARCHIVED`, or a skip reason) |
+| `kind` | `file`, `system`, `note`, `folder`, `keeper_note` |
+| `role` | `candidate` (selected by date), `follow`, `folder`, `keeper_note`, or `blocked` (may not be switched to `MOVE`) |
+| `category`, `copies` | from the listing's md5s |
+| `md5`, `size_bytes`, `size_gb`, `mtime`, `modified` | from the listing (`modified` is UTC) |
+| `original_path`, `archive_path` | where it is now, where it goes |
+| `extra` | for `keeper_note` rows: the archived keeper |
+| `long_path`, `check` | as in quarantine_duplicates.py |
+
+**Editing the plan:** only `action` between `MOVE` and `SKIP`, as in
+quarantine_duplicates.py. Use R or a text editor, not Excel. Switching a
+file to `SKIP` keeps its folder on the storage (`FOLDER_KEPT`).
+
+`--no-preflight` skips checking every file on the storage while planning
+(much faster on a large volume); `execute` checks each file anyway.
+
+#### 2. Execute
+
+```powershell
+python archive_old_files.py execute --plan "C:\reports\archive\archive_plan_20261020_101500.csv" --workers 16
+```
+
+1. Validates the plan, refuses if `move_to_archive` already holds another
+   batch, and creates it.
+2. **Moves the files** (`os.rename`, so metadata-only on the same volume),
+   after checking each still has the listing's size and mtime (±2 s). Writes
+   the note line on both sides, then the journal line.
+3. **Updates the quarantine notes** of archived keepers.
+4. **Removes the emptied folders**, deepest first: moves their notes and
+   system files along, removes the folder, and writes the `removed_folder`
+   line in its parent.
+5. Writes `archive_manifest.csv` and updates `<root>\_archived_to_tape.csv`.
+6. Runs **verify** (unless `--no-verify`) and writes
+   **`<plan>_remaining_raw.csv`** (unless `--no-remaining`).
+
+Re-run the same command to resume after a crash or Ctrl+C. Retry only the
+files that failed (`ERROR`, `MOVE_FAILED`, `MOVE_TIMEOUT`) with
+`--retry-failed`, as in quarantine_duplicates.py; notes and emptied folders
+are always processed again. For `MOVE_FAILED` with *Access is denied*, see
+[`change_folder_permissions.py`](#change_folder_permissionspy).
+
+**`<plan>_remaining_raw.csv`** is the listing of what stays on the storage:
+the plan's listing minus the moved files, with the notes this run wrote
+re-hashed. It's written in minutes, without rescanning. It matches a real
+rescan, and it's the input for the next archive or quarantine plan and for
+[`storage_report_by_year.R`](R_plots/storage_report_by_year.R).
+
+#### 3. Copy to tape
+
+Copy `<root>\move_to_archive` to tape, check the copy against
+`archive_manifest.csv` (one row per file, with md5), then delete
+`move_to_archive`. The next `plan` refuses to start while `move_to_archive`
+still holds files.
+
+#### 4. Verify (runs automatically after execute)
+
+```powershell
+python archive_old_files.py verify --plan "C:\reports\archive\archive_plan_20261020_101500.csv" --threading
+```
+
+Re-hashes everything under `move_to_archive` and matches it to the journal by
+expected path and md5. Notes are only checked for presence, since their
+content grows by design. Writes `<plan>_verify_report.csv` with the
+quarantine_duplicates.py statuses (`OK`, `MISSING`, `MD5_MISMATCH`,
+`UNREADABLE`, `EXTRA`, `MOVED_NOT_JOURNALED`, `NOT_MOVED`, `SKIPPED_<reason>`,
+`UNSCANNED_FOLDER`), plus `SIZE_MISMATCH` (listing without md5),
+`FOLDER_REMOVED` and `FOLDER_KEPT`.
+
+#### 5. Undo (before deleting `move_to_archive`)
+
+```powershell
+python archive_old_files.py undo --plan "C:\reports\archive\archive_plan_20261020_101500.csv"
+```
+
+Moves every journaled file back, recreates the removed folders, removes every
+line this plan added (in notes on both sides, in quarantine notes and in the
+root index; a note left with only its header is deleted), removes the
+manifest and the emptied `move_to_archive`, and rewrites
+`<plan>_remaining_raw.csv`. It's safe to re-run. Tested against a rescan: data
+files are back with identical paths, md5s and mtimes.
+
+### Skip reasons and statuses
+
+| reason / status | when |
+|---|---|
+| `CATEGORY_NOT_SELECTED` | in the date range but not in `--categories` (may be switched to `MOVE`) |
+| `EXCLUDED_PATTERN` | matches `--exclude` |
+| `MTIME_UNKNOWN` | the scan couldn't stat the file (its mtime reads as 1970-01-01), so its age is unknown |
+| `GIT_PARTIAL` | in a `.git` folder whose files aren't all selected |
+| `FILE_MISSING` / `FILE_CHANGED` / `FILE_UNREADABLE` | the file is gone or differs from the listing (pre-flight, or `SKIPPED_…` in execute) |
+| `FOLDER_KEPT` (execute) | the folder still holds files, a follower is set to `SKIP`, or the quarantine isn't finalized; `detail` says which |
+| `KEEPER_NOT_MOVED` (execute) | the keeper of a quarantine note wasn't moved, so the note wasn't changed |
+| `CONFLICT`, `MISSING`, `MOVED_RESUMED`, `ALREADY_MOVED` | as in quarantine_duplicates.py's *Resuming* table |
+
+### Arguments
+
+| Subcommand | Argument | Description |
+|---|---|---|
+| `plan` | `--root` | The storage folder. `move_to_archive` is created directly under it. Required. |
+| | `--output` | Folder for the plan and all reports. Not inside `move_to_archive`. Required. |
+| | `--raw-csv` | The newest raw listing of `--root` (see *Input*). Default: scan and hash `--root`. |
+| | `--before DATE` | Files modified before DATE (UTC), e.g. `2016-01-01`. |
+| | `--from DATE --to DATE` | Files modified from DATE (included) to DATE (excluded). Instead of `--before`. |
+| | `--categories` | `all`, or one or more of `unique`, `keeper`, `duplicate`, `unreadable`. Required. |
+| | `--archive-label` | Name of the tape or batch (e.g. `LTO-0042`), written in every note, the manifest and the index. Required. |
+| | `--exclude` | Wildcard patterns never to move, matched against file name or full path. |
+| | `--no-preflight` | Don't check the files on the storage while planning. |
+| | `--threading`, `--workers` | Hash concurrently during the scan; threads for scan, pre-flight and reading quarantine notes. Default: 8. |
+| `execute` | `--plan` | The reviewed `archive_plan_<timestamp>.csv`. Required. |
+| | `--output` | Folder for journal/reports. Default: the plan's folder. |
+| | `--no-verify` / `--no-remaining` | Skip verify / the remaining listing afterwards. |
+| | `--retry-failed` | Only retry the files whose latest result is `ERROR`, `MOVE_FAILED` or `MOVE_TIMEOUT`. |
+| | `--workers`, `--threading` | Threads for moving (and for hashing during verify with `--threading`). Default: 8. |
+| `verify` | `--plan`, `--output`, `--threading`, `--workers` | As above. |
+| `undo` | `--plan`, `--output`, `--no-remaining`, `--workers` | As above. |
+| all | `--io-timeout` | Seconds to wait for one filesystem operation before giving up on it. Default: 10. |
+
+### Output files
+
+| file | where | written by | content |
+|---|---|---|---|
+| `archive_scan_<ts>_raw.csv`, `_skipped_folders.csv` | `--output` | plan (without `--raw-csv`) | the scan's raw listing and unscannable folders |
+| `archive_plan_<ts>.csv`, `_settings.json` | `--output` | plan | the plan; root, listing, dates, categories, label |
+| `archive_plan_<ts>_journal.csv`, `_undo_journal.csv` | `--output` | execute / undo | every move, removed folder and restore, written live |
+| `archive_plan_<ts>_execute_results.csv` (`__movedFailed`) | `--output` | execute | outcome per row |
+| `archive_plan_<ts>_verify_report.csv` (`__movedFailed`) | `--output` | execute / verify | md5 verification |
+| `archive_plan_<ts>_remaining_raw.csv` | `--output` | execute / undo | raw listing of what stays on the storage |
+| `archive_plan_<ts>_undo_results.csv` | `--output` | undo | outcome per restore |
+| `archive_manifest.csv` | `<root>\move_to_archive` | execute | every file of the batch with all its metadata (goes to tape) |
+| `_archived_to_tape.csv` | `<root>` | execute / undo | cumulative index of everything archived from this storage |
+| `archived_files_location.txt` | folders on both sides | execute | the notes (see above) |
+
+### Generating test data
+
+[`support_scripts\generate_archive_test_data.py`](support_scripts/generate_archive_test_data.py)
+builds a storage with one of each case: an all-old project (removed whole, with
+a recent `desktop.ini` that follows it), a mixed project (old file moves, a
+subfolder is removed, the folder stays with a note), a duplicate group (old
+keeper, old duplicate, recent duplicate), a folder holding only a quarantine
+note, a partly old and a fully old `.git` repository, and a file with an
+unknown mtime. It prints the commands to run and what to expect.
+
+```powershell
+python support_scripts\generate_archive_test_data.py --path "C:\path\to\test_area" --num-files 2 [--with-duplicates-folder] [--clean]
+```
+
+`--with-duplicates-folder` also creates `<storage>\duplicates`, to see folders
+with a quarantine note kept (`QUARANTINE_NOT_FINALIZED`).
+
+### Design decisions
+
+- **Move, don't copy or delete.** `os.rename` on the same volume is instant
+  and needs no extra space; nothing is lost until you delete
+  `move_to_archive` yourself, and `undo` reverses everything until then.
+- **Per file, by modification time**, as in elimination_file_candidates.py,
+  with the same mirrored structure as quarantine's `duplicates` folder.
+- **The plan step is the preview**: no separate analysis script. Re-planning
+  from a listing is fast, so trying other cutoffs costs nothing.
+- **Emptied folders are removed, their notes and system files go with
+  them**, so the storage isn't left with folders holding only text files. The
+  history travels to tape instead of being deleted.
+- **Notes on both sides, the manifest and the root index** each answer a
+  different question: "what left this folder", "where did this tape folder
+  come from", "check the tape copy", and "find anything archived from this
+  storage".
+- **The remaining listing is written automatically**, so the next plan, a
+  quarantine or the R reports always start from the current state without a
+  multi-day rescan.
+- **Categories from the listing itself**, not from duplicates_check.py's
+  summary, so they work with any listing, including remaining listings.
+- **One batch at a time** in `move_to_archive`: a new plan refuses to start
+  while it still holds files.
+- **Same scale design as quarantine_duplicates.py**: CSVs streamed in blocks
+  of 20,000 rows, path sets as 8-byte fingerprints, work on `--workers`
+  threads, timeouts on every filesystem call, long paths through `\\?\`.
 
 ---
 
