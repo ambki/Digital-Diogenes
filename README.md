@@ -1422,9 +1422,27 @@ python archive_old_files.py plan `
 ```
 
 Add `--raw-csv <listing>` to skip the scan. Use `--from 2010-01-01 --to
-2016-01-01` instead of `--before` for a window. Dates are **UTC**, like the
-mtimes in every listing. `--before` excludes the date itself. `--from`
-includes its date and `--to` excludes its date.
+2016-01-01` instead of `--before` for a window.
+
+**Which days the dates include.** A date means midnight at the start of that
+day, so:
+
+| Option | Selects | Example |
+|---|---|---|
+| `--before D` | mtime earlier than D 00:00:00. **D itself is not included.** | `--before 2021-01-01` → up to 2020-12-31 23:59:59 |
+| `--from A --to B` | from A 00:00:00 (included) up to B 00:00:00 (not included) | `--from 2010-01-01 --to 2021-01-01` → 2010 to 2020 |
+
+Consecutive windows (`--to 2021-01-01`, then `--from 2021-01-01`) never
+overlap or leave a gap. To include a day, give the next one (`--before
+2021-01-02` includes 1 January 2021), or add a time (`--before "2021-01-01
+12:00"`).
+
+Dates are **UTC**, like the mtimes in every listing, so the cutoff is
+midnight UTC: 01:00 local time in Central European winter, 02:00 in summer.
+A file saved on 1 January 2021 at 00:30 local winter time has the UTC mtime
+2020-12-31 23:30, so `--before 2021-01-01` *does* select it. This only
+matters for files modified within an hour or two of midnight on the cutoff
+date.
 
 The summary shows the files to move per year, per category and per top
 folder (two levels under the root), the skips, the folders that will be
@@ -1539,7 +1557,7 @@ files are back with identical paths, md5s and mtimes.
 | `plan` | `--root` | The storage folder. `move_to_archive` is created directly under it. Required. |
 | | `--output` | Folder for the plan and all reports. Not inside `move_to_archive`. Required. |
 | | `--raw-csv` | The newest raw listing of `--root` (see *Input*). Default: scan and hash `--root`. |
-| | `--before DATE` | Files modified before DATE (UTC), e.g. `2016-01-01`. |
+| | `--before DATE` | Files modified before DATE 00:00 UTC (DATE itself is not included), e.g. `2016-01-01`. See *Which days the dates include*. |
 | | `--from DATE --to DATE` | Files modified from DATE (included) to DATE (excluded). Instead of `--before`. |
 | | `--categories` | `all`, or one or more of `unique`, `keeper`, `duplicate`, `unreadable`. Required. |
 | | `--archive-label` | Name of the tape or batch (e.g. `LTO-0042`), written in every note, the manifest and the index. Required. |
