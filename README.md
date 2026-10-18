@@ -1472,6 +1472,25 @@ file to `SKIP` keeps its folder on the storage (`FOLDER_KEPT`).
 `--no-preflight` skips checking every file on the storage while planning
 (much faster on a large volume); `execute` checks each file anyway.
 
+**Profiling a plan in R:
+[`archive_plan.R`](R_plots/archive_plan.R).** Plots and tables of what the
+plan would do, in number of files *and* in storage space. Set `plan_path` and
+`output_folder` in the configuration block (the listing is found through the
+plan's settings file; set `raw_path` only if it has moved), run section
+**0. Setup** once, then any section on its own (RStudio: Ctrl+Alt+T). Each
+section's last line exports its plot into `output_folder`:
+
+| Section | What it shows | Exported as |
+|---|---|---|
+| 1. Files vs space | Moves / in range but category not selected / in range but skipped / outside the date range, as a share of the volume's files and space | `archive_volume_share.png` |
+| 2. By year | Files and space per year last modified: moving (selected by date, or following an emptied folder) vs staying. The chart for choosing a cutoff | `archive_by_year.png` |
+| 3. By category | unique / keeper / duplicate / unreadable in the date range, moving vs staying | `archive_by_category.png` |
+| 4. Top folders | The folders (two levels under the root) with the most space and files to move, and the number of folders to remove | `archive_top_folders.png` |
+| 5. Skips | Files in the range that stay, per reason | `archive_skips.png`, `archive_skips.csv` |
+
+Sections 1 and 2 read the plan's listing (only once, kept as totals per
+year), so they take longest on a large volume.
+
 #### 2. Execute
 
 ```powershell
@@ -1523,6 +1542,27 @@ quarantine_duplicates.py statuses (`OK`, `MISSING`, `MD5_MISMATCH`,
 `UNREADABLE`, `EXTRA`, `MOVED_NOT_JOURNALED`, `NOT_MOVED`, `SKIPPED_<reason>`,
 `UNSCANNED_FOLDER`), plus `SIZE_MISMATCH` (listing without md5),
 `FOLDER_REMOVED` and `FOLDER_KEPT`.
+
+**Reporting on an execution in R:
+[`archive_execution.R`](R_plots/archive_execution.R).** Plots of what
+`execute`, verify and `undo` actually did, from the files they write next to
+the plan. Set `plan_path` (the executed plan) and `output_folder`, run
+**0. Setup** once (it reads nothing big), then any section on its own:
+
+| Section | What it shows | From | Exported as |
+|---|---|---|---|
+| 1. Execute outcome | Moved / stayed with a kept folder / skipped by a safety check / problem, per status, in files and space | `_execute_results.csv` (last run) | `archive_execution_outcome.png` |
+| 2. Progress over time | Cumulative files and space moved, all runs; restores by `undo` count down | `_journal.csv` + `_undo_journal.csv` | `archive_execution_timeline.png` |
+| 3. Verification | `OK`, `NOT_MOVED`, `SKIPPED_*` and problem statuses, in files and space | `_verify_report.csv` | `archive_execution_verification.png` |
+| 4. Problems | What execute couldn't do (e.g. `MOVE_FAILED: PermissionError`), by type and by folder | `_execute_results.csv` | `archive_execution_problems.png`, `archive_execution_problems.csv` |
+| 5. Folders | Emptied folders removed vs kept, why they were kept, and the quarantine notes updated | `_execute_results.csv` | `archive_execution_folders.png`, `archive_execution_kept_folders.csv` |
+| 6. Moved per folder | What is in `move_to_archive` now, per original folder (net of restores) | `_journal.csv` + `_undo_journal.csv` | `archive_execution_space_by_folder.png` |
+
+For the storage as a whole, before and after:
+[`storage_report_by_year.R`](R_plots/storage_report_by_year.R) works
+unchanged on the scan's `archive_scan_<ts>_raw.csv` (before) and on
+`<plan>_remaining_raw.csv` (after); its storage comparison section can compare
+the two directly.
 
 #### 5. Undo (before deleting `move_to_archive`)
 
