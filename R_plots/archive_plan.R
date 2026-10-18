@@ -254,7 +254,11 @@ export_plot(p_share, "archive_volume_share", height = 4.5)
 
 # ---- 2. By year modified: what moves and what stays ------------------------------
 
-first_year <- 1995  # the chart starts here; earlier (often implausible, e.g. 1065) and unknown dates are only counted in its caption
+# Years shown in the chart. Dates outside this range (often impossible ones,
+# e.g. 1065 or 9785, from wrong clocks or tools) and unknown dates aren't
+# drawn; their totals go in the chart's caption.
+first_year <- 1995
+last_year  <- as.integer(format(Sys.Date(), "%Y"))  # this year
 
 # Notes and system files that follow their emptied folder move whatever their
 # date (usually recent), so they get their own colour.
@@ -270,17 +274,18 @@ stays_by_year <- get_listing() %>%
 all_years <- bind_rows(moved_by_year, stays_by_year)
 print(all_years %>% pivot_wider(names_from = fate, values_from = c(files, gb), values_fill = 0) %>% arrange(year), n = Inf)
 
-# The chart: every year from first_year to the last one in the data (empty
-# years included, so gaps show). Earlier and unknown years are left out of the
-# chart and summed in its caption instead.
+# The chart: every year from first_year to last_year (empty years included,
+# so gaps show). Years outside the range and unknown years are summed in the
+# caption instead.
 year_num  <- suppressWarnings(as.integer(all_years$year))
-last_year <- max(year_num, na.rm = TRUE)
-shown     <- !is.na(year_num) & year_num >= first_year
+shown     <- !is.na(year_num) & year_num >= first_year & year_num <= last_year
 left_out  <- all_years[!shown, ] %>%
-  mutate(group = ifelse(year == "unknown", "unknown date", sprintf("before %d", first_year))) %>%
+  mutate(group = case_when(is.na(year_num[!shown]) ~ "unknown date",
+                           year_num[!shown] < first_year ~ sprintf("before %d", first_year),
+                           TRUE ~ sprintf("after %d", last_year))) %>%
   group_by(group) %>% summarise(files = sum(files), gb = sum(gb), .groups = "drop")
 left_out_text <- if (nrow(left_out) == 0) "" else paste0(
-  " | not shown: ", paste(sprintf("%s %s files (%s)", left_out$group, fmt_files(left_out$files), fmt_size(left_out$gb)),
+  " | not shown: ", paste(sprintf("%s %s file(s) (%s)", left_out$group, fmt_files(left_out$files), fmt_size(left_out$gb)),
                           collapse = ", "))
 print(left_out)
 years <- all_years[shown, ] %>%
