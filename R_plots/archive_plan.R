@@ -41,14 +41,29 @@ library(jsonlite)
 # the plan's settings (set it only if that file has moved since).
 
 ##Volume A
-plan_path     <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry\archive_plan_YYYYMMDD_HHMMSS.csv)"
+plan_path     <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry\archive_plan_*.csv)"
 raw_path      <- NA
 output_folder <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry)"
 
 ##Volume B
-plan_path     <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry\archive_plan_YYYYMMDD_HHMMSS.csv)"
+plan_path     <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry\archive_plan_*.csv)"
 raw_path      <- NA
 output_folder <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry)"
+
+# plan_path may use a wildcard (archive_plan_*.csv): the plan in that folder
+# is found by its name (archive_plan_<date>_<time>.csv, so the journal and
+# report files next to it are ignored); with several plans, the newest is used.
+resolve_plan <- function(path) {
+  if (!grepl("*", path, fixed = TRUE)) return(path)
+  found <- list.files(dirname(path), pattern = glob2rx(basename(path)), full.names = TRUE)
+  found <- found[grepl("^archive_plan_[0-9]{8}_[0-9]{6}\\.csv$", basename(found))]
+  if (length(found) == 0) stop(sprintf("No archive_plan_<date>_<time>.csv matches %s", path))
+  chosen <- sort(found, decreasing = TRUE)[1]
+  cat(sprintf("Plan: %s%s\n", chosen,
+              if (length(found) > 1) sprintf(" (newest of %d plans in that folder)", length(found)) else ""))
+  chosen
+}
+plan_path <- resolve_plan(plan_path)
 
 top_n      <- 15        # folders shown in the "top" charts
 chunk_rows <- 500000    # rows read at a time (memory vs. speed)

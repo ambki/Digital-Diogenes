@@ -1475,7 +1475,10 @@ file to `SKIP` keeps its folder on the storage (`FOLDER_KEPT`).
 **Profiling a plan in R:
 [`archive_plan.R`](R_plots/archive_plan.R).** Plots and tables of what the
 plan would do, in number of files *and* in storage space. Set `plan_path` and
-`output_folder` in the configuration block (the listing is found through the
+`output_folder` in the configuration block. `plan_path` can end in
+`archive_plan_*.csv` instead of the exact file name: the plan in that folder
+is found by its name (the journal and report files next to it are ignored),
+and with several plans the newest is used (the listing is found through the
 plan's settings file; set `raw_path` only if it has moved), run section
 **0. Setup** once, then any section on its own (RStudio: Ctrl+Alt+T). Each
 section's last line exports its plot into `output_folder`:
@@ -1546,7 +1549,8 @@ quarantine_duplicates.py statuses (`OK`, `MISSING`, `MD5_MISMATCH`,
 **Reporting on an execution in R:
 [`archive_execution.R`](R_plots/archive_execution.R).** Plots of what
 `execute`, verify and `undo` actually did, from the files they write next to
-the plan. Set `plan_path` (the executed plan) and `output_folder`, run
+the plan. Set `plan_path` (the executed plan; `archive_plan_*.csv` works here
+too) and `output_folder`, run
 **0. Setup** once (it reads nothing big), then any section on its own:
 
 | Section | What it shows | From | Exported as |
