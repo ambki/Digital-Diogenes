@@ -1469,6 +1469,31 @@ quarantine note to update, and per folder to remove:
 quarantine_duplicates.py. Use R or a text editor, not Excel. Switching a
 file to `SKIP` keeps its folder on the storage (`FOLDER_KEPT`).
 
+**Excluding folders (`--exclude`).** List one or more patterns after
+`--exclude`, separated by spaces, each in quotes:
+
+```powershell
+--exclude "R:\projects\instrument_A\*" "R:\shared\keep_online\*"
+```
+
+A pattern must match a file's **whole** full path or its whole file name
+(case-insensitive), so a folder pattern **must end in `\*`**:
+
+| Pattern | Matches the files inside the folder? |
+|---|---|
+| `"R:\projects\instrument_A\*"` | yes: that folder and everything under it |
+| `"*\instrument_A\*"` | yes: every folder named `instrument_A`, at any depth |
+| `"R:\projects\instrument_A"` or `"R:\projects\instrument_A\"` | **no**: nothing is excluded, and no warning is given |
+
+Use the same spelling as the listing (`R:\…` or `\\server\share\…`). Check
+the plan summary: excluded files show up as `EXCLUDED_PATTERN` in the
+"Skipped" line. They can still be switched to `MOVE` by hand, they keep their
+folders (and the parent folders) on the storage, and they still count for the
+duplicate categories. `--exclude` doesn't shorten the scan: to skip folders in
+the scan too, scan with `duplicates_check.py --folder … --excluded <folders>`
+and pass its `_raw.csv` as `--raw-csv` (their files then don't count for the
+categories either).
+
 `--no-preflight` skips checking every file on the storage while planning
 (much faster on a large volume); `execute` checks each file anyway.
 
@@ -1605,7 +1630,7 @@ files are back with identical paths, md5s and mtimes.
 | | `--from DATE --to DATE` | Files modified from DATE (included) to DATE (excluded). Instead of `--before`. |
 | | `--categories` | `all`, or one or more of `unique`, `keeper`, `duplicate`, `unreadable`. Required. |
 | | `--archive-label` | Name of the tape or batch (e.g. `LTO-0042`), written in every note, the manifest and the index. Required. |
-| | `--exclude` | Wildcard patterns never to move, matched against file name or full path. |
+| | `--exclude` | One or more wildcard patterns never to move, matched against the whole file name or full path. A folder needs a trailing `\*`, e.g. `--exclude "R:\A\*" "R:\B\*"`. See *Excluding folders*. |
 | | `--no-preflight` | Don't check the files on the storage while planning. |
 | | `--threading`, `--workers` | Hash concurrently during the scan; threads for scan, pre-flight and reading quarantine notes. Default: 8. |
 | `execute` | `--plan` | The reviewed `archive_plan_<timestamp>.csv`. Required. |
