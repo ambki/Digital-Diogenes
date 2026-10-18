@@ -1483,7 +1483,7 @@ section's last line exports its plot into `output_folder`:
 | Section | What it shows | Exported as |
 |---|---|---|
 | 1. Files vs space | Moves / in range but category not selected / in range but skipped / outside the date range, as a share of the volume's files and space | `archive_volume_share.png` |
-| 2. By year | Files and space per year last modified: moving (selected by date, or following an emptied folder) vs staying. The chart for choosing a cutoff | `archive_by_year.png` |
+| 2. By year | Files and space per year last modified, from `first_year` (default 1995) to the last year in the data: moving (selected by date, or following an emptied folder) vs staying. The chart for choosing a cutoff. Earlier dates (often impossible ones such as 1065, from wrong clocks or tools) and unknown dates aren't drawn; the caption gives their totals | `archive_by_year.png` |
 | 3. By category | unique / keeper / duplicate / unreadable in the date range, moving vs staying | `archive_by_category.png` |
 | 4. Top folders | The folders (two levels under the root) with the most space and files to move, and the number of folders to remove | `archive_top_folders.png` |
 | 5. Skips | Files in the range that stay, per reason | `archive_skips.png`, `archive_skips.csv` |

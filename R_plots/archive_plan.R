@@ -254,6 +254,8 @@ export_plot(p_share, "archive_volume_share", height = 4.5)
 
 # ---- 2. By year modified: what moves and what stays ------------------------------
 
+first_year <- 1995  # the chart starts here; earlier (often implausible, e.g. 1065) and unknown dates are only counted in its caption
+
 # Notes and system files that follow their emptied folder move whatever their
 # date (usually recent), so they get their own colour.
 year_colours <- c("Moves: in the date range" = series[1], "Moves: follows its emptied folder" = series[3],
@@ -265,17 +267,33 @@ stays_by_year <- get_listing() %>%
   left_join(moved_by_year %>% group_by(year) %>% summarise(m_files = sum(files), m_gb = sum(gb)), by = "year") %>%
   transmute(year, fate = "Stays",
             files = pmax(files - coalesce(m_files, 0), 0), gb = pmax(gb - coalesce(m_gb, 0), 0))
-years <- bind_rows(moved_by_year, stays_by_year) %>%
+all_years <- bind_rows(moved_by_year, stays_by_year)
+print(all_years %>% pivot_wider(names_from = fate, values_from = c(files, gb), values_fill = 0) %>% arrange(year), n = Inf)
+
+# The chart: every year from first_year to the last one in the data (empty
+# years included, so gaps show). Earlier and unknown years are left out of the
+# chart and summed in its caption instead.
+year_num  <- suppressWarnings(as.integer(all_years$year))
+last_year <- max(year_num, na.rm = TRUE)
+shown     <- !is.na(year_num) & year_num >= first_year
+left_out  <- all_years[!shown, ] %>%
+  mutate(group = ifelse(year == "unknown", "unknown date", sprintf("before %d", first_year))) %>%
+  group_by(group) %>% summarise(files = sum(files), gb = sum(gb), .groups = "drop")
+left_out_text <- if (nrow(left_out) == 0) "" else paste0(
+  " | not shown: ", paste(sprintf("%s %s files (%s)", left_out$group, fmt_files(left_out$files), fmt_size(left_out$gb)),
+                          collapse = ", "))
+print(left_out)
+years <- all_years[shown, ] %>%
   mutate(fate = factor(fate, levels = names(year_colours)),
-         year = factor(year, levels = sort(unique(year))))
-print(years %>% pivot_wider(names_from = fate, values_from = c(files, gb), values_fill = 0), n = Inf)
+         year = factor(year, levels = as.character(first_year:last_year))) %>%
+  complete(year, fate, fill = list(files = 0, gb = 0))
 
 year_panel <- function(column, panel_title, axis) {
   ggplot(years, aes(x = year, y = .data[[column]], fill = fate)) +
     geom_col(width = 0.75, position = position_stack(reverse = TRUE)) +
     scale_fill_manual(values = year_colours) +
     scale_y_continuous(labels = axis$labels, breaks = axis$breaks, expand = expansion(mult = c(0, 0.05))) +
-    scale_x_discrete(guide = guide_axis(check.overlap = TRUE)) +
+    scale_x_discrete(drop = FALSE, guide = guide_axis(check.overlap = TRUE)) +
     labs(title = panel_title, x = NULL, y = NULL) + theme_plan +
     theme(panel.grid.major.y = element_line(colour = gridcol, linewidth = 0.3),
           panel.grid.major.x = element_blank())
@@ -287,8 +305,7 @@ p_years <- (year_panel("files", "Files", list(labels = label_comma(), breaks = w
   plot_annotation(
     title = "Files per year last modified: what moves to the archive and what stays",
     subtitle = selection,
-    caption = sprintf("%s + %s | \"unknown\": the scan couldn't read the file's date",
-                      basename(plan_path), basename(raw_path)),
+    caption = sprintf("%s + %s%s", basename(plan_path), basename(raw_path), left_out_text),
     theme = theme_plan
   ) & theme(legend.position = "top", legend.justification = "left")
 print(p_years)
