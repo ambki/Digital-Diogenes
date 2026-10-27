@@ -1083,9 +1083,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["all", "folder", "origin", "destination", "between", "integrity"],
+        choices=["all", "between", "integrity"],
         default="all",
-        help="Which check to run.",
+        help=(
+            "Which check to run. With --folder, 'all' finds the duplicates inside "
+            "that folder. With --origin/--destination, 'all' finds the duplicates "
+            "inside each folder plus 'between' and 'integrity', which both need the pair."
+        ),
     )
     parser.add_argument(
         "--excel",
@@ -1157,8 +1161,10 @@ def parse_args() -> argparse.Namespace:
     if args.folder:
         if args.origin or args.destination:
             parser.error("Use either --folder or --origin/--destination, not both.")
-        if args.mode not in {"all", "folder"}:
-            parser.error("When using --folder, mode must be 'all' or 'folder'.")
+        if args.mode != "all":
+            parser.error(
+                f"Mode '{args.mode}' needs --origin and --destination, not --folder."
+            )
     else:
         if not args.origin or not args.destination:
             parser.error(
@@ -1300,9 +1306,6 @@ def main() -> None:
     origin_path = validate_folder(args.origin, "Origin")
     destination_path = validate_folder(args.destination, "Destination")
 
-    needs_origin_scan = args.mode in {"all", "origin", "between", "integrity"}
-    needs_destination_scan = args.mode in {"all", "destination", "between", "integrity"}
-
     # A --resume-from file combines both sides into one file list; split it
     # back into an origin subset and a destination subset by which root each
     # path falls under, so each scan resumes only its own files.
@@ -1317,33 +1320,27 @@ def main() -> None:
 
     # Each folder is hashed at most once and the resulting DataFrame is reused
     # across every check that needs it, instead of re-scanning per check.
-    if needs_origin_scan:
-        origin_scan, origin_skipped = scan_folder_md5(
-            origin_path,
-            use_threading=args.threading,
-            workers=args.workers or 8,
-            io_timeout=args.io_timeout,
-            included=included_paths,
-            excluded=excluded_paths,
-            on_stat_complete=on_stat_complete,
-            resume_file_paths=origin_resume_paths,
-        )
-    else:
-        origin_scan, origin_skipped = None, []
+    origin_scan, origin_skipped = scan_folder_md5(
+        origin_path,
+        use_threading=args.threading,
+        workers=args.workers or 8,
+        io_timeout=args.io_timeout,
+        included=included_paths,
+        excluded=excluded_paths,
+        on_stat_complete=on_stat_complete,
+        resume_file_paths=origin_resume_paths,
+    )
 
-    if needs_destination_scan:
-        destination_scan, destination_skipped = scan_folder_md5(
-            destination_path,
-            use_threading=args.threading,
-            workers=args.workers or 8,
-            io_timeout=args.io_timeout,
-            included=included_paths,
-            excluded=excluded_paths,
-            on_stat_complete=on_stat_complete,
-            resume_file_paths=destination_resume_paths,
-        )
-    else:
-        destination_scan, destination_skipped = None, []
+    destination_scan, destination_skipped = scan_folder_md5(
+        destination_path,
+        use_threading=args.threading,
+        workers=args.workers or 8,
+        io_timeout=args.io_timeout,
+        included=included_paths,
+        excluded=excluded_paths,
+        on_stat_complete=on_stat_complete,
+        resume_file_paths=destination_resume_paths,
+    )
 
     total_skipped = len(origin_skipped) + len(destination_skipped)
     if total_skipped:
@@ -1352,7 +1349,7 @@ def main() -> None:
             "skipped (see warnings above)."
         )
 
-    if args.mode in {"all", "origin"}:
+    if args.mode == "all":
         print("Finding origin duplicates and building summary ...")
         origin_duplicates = find_real_duplicates(origin_scan)
         origin_summary = build_duplicate_summary(origin_duplicates)
@@ -1362,7 +1359,7 @@ def main() -> None:
             excel_sheets["origin_duplicates"] = origin_duplicates
             excel_sheets["origin_summary"] = origin_summary
 
-    if args.mode in {"all", "destination"}:
+    if args.mode == "all":
         print("Finding destination duplicates and building summary ...")
         destination_duplicates = find_real_duplicates(destination_scan)
         destination_summary = build_duplicate_summary(destination_duplicates)

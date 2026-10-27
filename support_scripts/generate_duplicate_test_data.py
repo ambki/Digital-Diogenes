@@ -29,7 +29,7 @@ def _write_file(path: Path, content: bytes) -> None:
 
 
 def build_folder_test_files(large_file_mb: int, num_files: int) -> dict[str, bytes]:
-    """Fixtures for `duplicates_check.py --folder ... --mode folder`.
+    """Fixtures for `duplicates_check.py --folder ...`.
 
     num_files repeats the whole fixture set (2 unique + 3-file duplicate
     group + large duplicate pair = 7 files per repetition) under a unique
@@ -140,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["all", "folder", "origin", "destination", "between", "integrity"],
+        choices=["all", "folder", "between", "integrity"],
         default="all",
         help=(
             "Which duplicates_check.py check to build a scenario for "
@@ -207,7 +207,7 @@ def main() -> None:
         print(f"\nCreated folder-mode scenario at: {folder_test_root}")
         print(
             "  Run: python duplicates_check.py "
-            f'--folder "{folder_test_root}" --mode folder --threading --workers 8'
+            f'--folder "{folder_test_root}" --threading --workers 8'
         )
 
     if args.mode != "folder":
@@ -217,9 +217,8 @@ def main() -> None:
         add_baseline(origin_files, destination_files)
 
         for index in range(1, args.num_files + 1):
-            if args.mode in {"all", "origin"}:
+            if args.mode == "all":
                 add_origin_internal_duplicates(origin_files, index)
-            if args.mode in {"all", "destination"}:
                 add_destination_internal_duplicates(destination_files, index)
             if args.mode in {"all", "between"}:
                 add_cross_folder_moved_duplicate(origin_files, destination_files, index)

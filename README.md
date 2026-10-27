@@ -90,7 +90,7 @@ huge scan doesn't spend hours formatting output). Passing `--excel` additionally
 every result table to its own CSV file (despite the flag's name — see
 "Also export results" below for why it's CSV, not an actual `.xlsx`).
 
-Every duplicate group (in `folder`/`origin`/`destination`/`between`) also
+Every duplicate group (in `--folder`, the origin/destination duplicates, and `between`) also
 reports the **oldest copy** — the file with the earliest modification time —
 as `oldest_path` and `oldest_modified`. For `between`, `oldest_source` says
 whether that oldest copy lives in the origin or the destination. The idea is
@@ -131,9 +131,18 @@ Use `--mode` with an origin/destination pair:
 ```powershell
 python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode integrity
 python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode between
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode origin
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode destination
 ```
+
+The folders you give decide how far the analysis goes; `--mode` only picks
+among the checks that need the pair:
+
+| Folders given | `--mode all` (default, can be left out) | `--mode between` / `integrity` |
+|---|---|---|
+| `--folder X` | duplicates inside X | error: needs `--origin` and `--destination` |
+| `--origin X --destination Y` | duplicates inside X, duplicates inside Y, `between`, `integrity` | only that check |
+
+There is no mode for the duplicates inside only the origin or only the
+destination: that is the single-folder scan above (`--folder`).
 
 #### Also export results
 
@@ -280,7 +289,7 @@ Every mode starts from the same scan: a table of `path, filename, size_bytes, md
 for each file in a folder. The modes differ only in how they compare rows of
 that table.
 
-#### `folder` / `origin` / `destination` — duplicates inside one folder
+#### `--folder`, and the origin/destination duplicates of `all` — duplicates inside one folder
 
 Groups the rows of **a single folder's table** by `md5`. Any hash that shows
 up 2+ times is a duplicate group — filenames and paths are irrelevant.
@@ -344,7 +353,7 @@ python support_scripts\generate_duplicate_test_data.py --path "C:\path\to\test_a
 | Argument           | Description                                                                                   |
 |--------------------|-------------------------------------------------------------------------------------------------|
 | `--path`           | Base folder where the test folders will be created. Required.                                   |
-| `--mode`           | Which check to build a scenario for: `all` (default), `folder`, `origin`, `destination`, `between`, `integrity`. |
+| `--mode`           | Which check to build a scenario for: `all` (default), `folder`, `between`, `integrity`. |
 | `--large-file-mb`  | Size in MB of each large duplicated file pair, used to actually exercise the progress bar and `--threading`. Default: **20**. |
 | `--num-files`      | Multiplier applied to every fixture group (duplicate groups, moved/OK/mismatch/missing files, large pairs), keeping their proportions fixed while scaling up total file count — e.g. `--num-files 50` gives 50 duplicate groups, 50 moved files, 50 large pairs, etc. instead of 1 of each. Default: **1**. |
 | `--clean`          | Remove this script's own previously generated subfolders (`folder_test`, `origin`, `destination`) under `--path` before regenerating. Never touches anything else under `--path`. |
@@ -356,11 +365,11 @@ enough to watch its own hash crawl along — they're independent knobs.
 
 For `--mode all` it creates:
 
-- `folder_test\` — for `duplicates_check.py --folder ... --mode folder`: unique
+- `folder_test\` — for `duplicates_check.py --folder ...`: unique
   files, a small duplicate group, and a large duplicate pair.
 - `origin\` and `destination\` — for the origin/destination modes:
-  - a duplicate group inside `origin\` only (for `--mode origin`)
-  - a duplicate group inside `destination\` only (for `--mode destination`)
+  - a duplicate group inside `origin\` only, and one inside `destination\`
+    only (found by `--mode all`)
   - a file moved to a different relative path with identical content in the
     destination (for `--mode between` — see *Why `between` and `integrity`
     can disagree* above)
@@ -437,7 +446,7 @@ final export, which builds a second full table, is the next thing to trim.
 | `--folder`      | Single folder to scan recursively for duplicates. Mutually exclusive with `--origin`/`--destination`. |
 | `--origin`      | Origin/source folder to scan. Required together with `--destination`.        |
 | `--destination` | Destination/backup folder to scan. Required together with `--origin`.        |
-| `--mode`        | Which check(s) to run: `all` (default), `folder`, `origin`, `destination`, `between`, `integrity`. |
+| `--mode`        | Which check(s) to run: `all` (default), `between`, `integrity`. With `--folder`, only `all` (the duplicates inside that folder). With `--origin`/`--destination`, `all` runs every check: the duplicates inside each folder, `between` and `integrity`. |
 | `--excel`       | Optional base path; if given, writes every result table to its own `<stem>_<table>.csv` (not an actual `.xlsx`, despite the flag's name — see above). If omitted, results are only printed to the terminal. |
 | `--threading`   | Hash files concurrently using multiple threads. Off by default.              |
 | `--workers`     | Number of hashing threads to use. Requires `--threading`. Default: 8.        |
