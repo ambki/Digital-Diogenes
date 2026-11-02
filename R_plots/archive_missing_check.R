@@ -17,18 +17,20 @@
 # section exports it into output_folder. In RStudio: Ctrl+Alt+T runs the
 # current section.
 #
-# Inputs:
-#   archive plan(s)        archive_plan_<date>_<time>.csv: their FILE_MISSING rows,
-#                          plus MISSING / SKIPPED_FILE_MISSING from the
-#                          <plan>_execute_results.csv next to each (if executed)
-#   quarantine journal(s)  move_plan_<date>_<time>_journal.csv (+ its
-#                          _undo_journal.csv, found automatically): which files
-#                          the quarantine moved, to where, and their keeper
-#   <root>\_archived_to_tape.csv   what is on tape (found from each plan's settings)
-#   each plan's listing    the raw_csv in its settings: the other copies on the storage
-#   duplicates raw         optional: the duplicates_check.py _raw.csv the
-#                          quarantine was planned from, to tell whether a file
-#                          was the keeper (oldest copy) back then
+# Inputs (set them in the configuration block below):
+#   REQUIRED  archive plan(s)        archive_plan_<date>_<time>.csv: their FILE_MISSING rows,
+#                                    plus MISSING / SKIPPED_FILE_MISSING from the
+#                                    <plan>_execute_results.csv next to each (if executed)
+#   REQUIRED  _archived_to_tape.csv  what is on tape: tape_index, or <root>\_archived_to_tape.csv
+#                                    with the root from each plan's settings
+#   OPTIONAL  quarantine journal(s)  move_plan_<date>_<time>_journal.csv (+ its
+#                                    _undo_journal.csv, found automatically): which files
+#                                    the quarantine moved, to where, and their keeper
+#   OPTIONAL  duplicates raw         the duplicates_check.py _raw.csv the quarantine was
+#                                    planned from, to tell whether a file was the keeper
+#                                    (oldest copy) back then
+#   AUTOMATIC each plan's listing    the raw_csv in its settings: the other copies on the
+#                                    storage (if it has moved, the check runs without it)
 # Disk: only the few paths involved are checked (file.exists): the keepers,
 # the quarantined copies, and up to max_checks other copies per content.
 #
@@ -48,24 +50,44 @@ library(htmlwidgets)
 
 # Configuration. Same pattern as the other R scripts: the block for the
 # volume you want goes last (later assignments win).
-# plan_path: one or more plans. A wildcard (archive_plan_*.csv) takes EVERY
-#   plan in that folder (not only the newest, as in archive_plan.R), e.g. all
-#   the year-by-year batches; several folders: c(r"(...)", r"(...)").
-# quarantine_journal: one or more quarantine journals, wildcards allowed
-#   (move_plan_*_journal.csv); NA if there was no quarantine.
-# duplicates_raw: the duplicates_check.py _raw.csv, or NA.
+#
+# REQUIRED
+#   plan_path      One or more archive plans. A wildcard (archive_plan_*.csv)
+#                  takes EVERY plan in that folder (not only the newest, as in
+#                  archive_plan.R), e.g. all the year-by-year batches; plans in
+#                  several folders: c(r"(...)", r"(...)").
+#   tape_index     The _archived_to_tape.csv. Must exist: the script stops if
+#                  it isn't found. NA = <root>\_archived_to_tape.csv, with the
+#                  root recorded in each plan's settings; give a path if the
+#                  storage is now reached by another drive letter or path, or
+#                  to use a copy. (It's created by the first execute, so a
+#                  plan that was never executed can't be checked yet.)
+#   output_folder  Where the chart, table and CSV are saved.
+#
+# OPTIONAL (NA = not used)
+#   quarantine_journal  One or more quarantine journals, wildcards allowed
+#                  (move_plan_*_journal.csv; the _undo_journal.csv next to each
+#                  is found automatically). Strongly recommended if there was a
+#                  quarantine: without it, no file counts as quarantined, so
+#                  gone duplicates show as CHECK instead of OK.
+#   duplicates_raw The duplicates_check.py _raw.csv the quarantine was planned
+#                  from. Without it, the "Keeper in the duplicates run" column
+#                  stays empty and the "was the duplicates run's keeper"
+#                  verdict can't appear.
 
 ##Volume A
-plan_path          <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry\archive_plan_*.csv)"
-quarantine_journal <- r"(C:\path\to\storage_analysis\Volume_A\quarantine\move_plan_*_journal.csv)"
-duplicates_raw     <- NA
-output_folder      <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry)"
+plan_path          <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry\archive_plan_*.csv)"  # REQUIRED
+tape_index         <- NA                                                                       # REQUIRED (NA = <root>\_archived_to_tape.csv)
+output_folder      <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry)"                    # REQUIRED
+quarantine_journal <- r"(C:\path\to\storage_analysis\Volume_A\quarantine\move_plan_*_journal.csv)"  # OPTIONAL (NA = none)
+duplicates_raw     <- NA                                                                       # OPTIONAL (NA = none)
 
 ##Volume B
-plan_path          <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry\archive_plan_*.csv)"
-quarantine_journal <- r"(C:\path\to\storage_analysis\Volume_B\quarantine\move_plan_*_journal.csv)"
-duplicates_raw     <- NA
-output_folder      <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry)"
+plan_path          <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry\archive_plan_*.csv)"  # REQUIRED
+tape_index         <- NA                                                                       # REQUIRED (NA = <root>\_archived_to_tape.csv)
+output_folder      <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry)"                    # REQUIRED
+quarantine_journal <- r"(C:\path\to\storage_analysis\Volume_B\quarantine\move_plan_*_journal.csv)"  # OPTIONAL (NA = none)
+duplicates_raw     <- NA                                                                       # OPTIONAL (NA = none)
 
 chunk_rows <- 500000    # rows read at a time (memory vs. speed)
 max_checks <- 20        # other storage copies checked on disk per content (oldest first)
@@ -86,8 +108,9 @@ plans <- expand_paths(plan_path, "^archive_plan_[0-9]{8}_[0-9]{6}\\.csv$")
 if (length(plans) == 0) stop(sprintf("No archive_plan_<date>_<time>.csv matches %s", paste(plan_path, collapse = ", ")))
 journals <- expand_paths(quarantine_journal, "_journal\\.csv$")
 journals <- journals[!grepl("_undo_journal\\.csv$", journals)]
-cat(sprintf("Plans: %d | quarantine journals: %d | duplicates raw: %s\n",
-            length(plans), length(journals), if (is.na(duplicates_raw)) "none" else basename(duplicates_raw)))
+cat(sprintf("Plans: %d | quarantine journals: %d | duplicates raw: %s | tape index: %s\n",
+            length(plans), length(journals), if (is.na(duplicates_raw)) "none" else basename(duplicates_raw),
+            if (all(is.na(tape_index))) "<root>\\_archived_to_tape.csv (from the plans' settings)" else paste(tape_index, collapse = ", ")))
 
 # Plot style: validated default palette (light mode), status colours (always
 # shown with their label), ink for all text, hairline grid.
@@ -204,8 +227,13 @@ quarantine <- if (nrow(quarantine) == 0) tibble(k = character(), duplicates_path
 keeper_keys <- key(quarantine$keeper_path)
 
 # 3) The tape: every archived copy of these contents, and the keepers' own rows.
-tape <- bind_rows(lapply(unique(missing$root), function(root) {
-  read_filtered(file.path(root, "_archived_to_tape.csv"),
+tape_indexes <- if (all(is.na(tape_index))) unique(file.path(missing$root, "_archived_to_tape.csv")) else tape_index
+absent <- tape_indexes[!file.exists(tape_indexes)]
+if (length(absent)) stop(sprintf(paste0(
+  "Tape index not found: %s. Set tape_index to where it is; it's created by the first execute, ",
+  "so if no plan has been executed yet, there is nothing on tape to check against."), paste(absent, collapse = ", ")))
+tape <- bind_rows(lapply(tape_indexes, function(index) {
+  read_filtered(index,
                 function(x) x %>% filter(kind == "file", tolower(md5) %in% md5s | key(original_path) %in% keeper_keys),
                 text_cols("archive_label", "kind", "original_path", "archive_path", "md5", "modified"))
 })) %>% mutate(md5 = tolower(md5), k = key(original_path))
@@ -215,6 +243,7 @@ tape <- bind_rows(lapply(unique(missing$root), function(root) {
 storage <- bind_rows(lapply(unique(paste(missing$listing, missing$root, sep = "|")), function(pair) {
   listing <- sub("\\|.*$", "", pair)
   root    <- key(sub("^.*\\|", "", pair))
+  if (!file.exists(listing)) cat(sprintf("NOTE: listing not found, its storage copies aren't checked: %s\n", listing))
   read_filtered(listing, function(x) x %>% filter(tolower(md5) %in% md5s), text_cols("path", "mtime", "md5")) %>%
     filter(!startsWith(key(path), paste0(root, "\\duplicates\\")),
            !startsWith(key(path), paste0(root, "\\move_to_archive\\")))

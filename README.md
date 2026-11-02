@@ -1675,15 +1675,17 @@ Missing files come from two places:
 
 A path that is missing in several chained plans counts once.
 
-Inputs (set the first three in the configuration block):
+Inputs (set them in the configuration block, where each line is marked
+`# REQUIRED` or `# OPTIONAL`):
 
 | Setting / file | What it is | Used for |
 |---|---|---|
-| `plan_path` | One or more archive plans. A wildcard (`archive_plan_*.csv`) takes **every** plan in that folder, e.g. all year-by-year batches; for plans in several folders, give a vector: `c(r"(...)", r"(...)")` | the missing files, plus `<plan>_execute_results.csv` next to each plan, if executed |
-| `quarantine_journal` | The quarantine's `move_plan_<ts>_journal.csv`, one or more, wildcards allowed (`move_plan_*_journal.csv`); its `_undo_journal.csv` is found automatically. `NA` if there was no quarantine | whether the quarantine moved the file, to which `duplicates_path`, and its `keeper_path` |
-| `duplicates_raw` | Optional: the duplicates_check.py `_raw.csv` the quarantine was planned from | whether the file was the keeper (oldest copy) in that run |
-| `<root>\_archived_to_tape.csv` | Found from each plan's settings | what's on tape: path, md5, date, label |
-| Each plan's listing | The `raw_csv` in its settings (e.g. the previous `_remaining_raw.csv`) | other copies of the same content on the storage |
+| `plan_path` (**required**) | One or more archive plans. A wildcard (`archive_plan_*.csv`) takes **every** plan in that folder, e.g. all year-by-year batches; for plans in several folders, give a vector: `c(r"(...)", r"(...)")` | the missing files, plus `<plan>_execute_results.csv` next to each plan, if executed |
+| `quarantine_journal` (optional, strongly recommended after a quarantine) | The quarantine's `move_plan_<ts>_journal.csv`, one or more, wildcards allowed (`move_plan_*_journal.csv`); its `_undo_journal.csv` is found automatically. `NA` if there was no quarantine | whether the quarantine moved the file, to which `duplicates_path`, and its `keeper_path` |
+| `duplicates_raw` (optional) | The duplicates_check.py `_raw.csv` the quarantine was planned from | whether the file was the keeper (oldest copy) in that run |
+| `tape_index` (**required**) | The `_archived_to_tape.csv`. `NA` (default) = `<root>\_archived_to_tape.csv`, with the root recorded in each plan's settings; set it if the storage is now reached by another drive letter or path, or to use a copy. The script stops if it isn't found. It's created by the first `execute`, so a plan that was never executed can't be checked yet | what's on tape: path, md5, date, label |
+| `output_folder` (**required**) | Where the chart, table and CSV are saved | |
+| Each plan's listing (automatic) | The `raw_csv` in its settings (e.g. the previous `_remaining_raw.csv`); if it has moved, the check notes it and runs without it | other copies of the same content on the storage |
 
 Each input is read in chunks, keeping only the rows that match a missing
 file's path or md5, so even a large volume takes little time and memory. Only
