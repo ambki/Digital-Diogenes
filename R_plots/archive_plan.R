@@ -20,9 +20,10 @@
 #
 # Memory: the plan and the listing are read in chunks; each chunk is reduced
 # to a few small columns (paths become their top folder) before the next one
-# is read, and the listing is only kept as totals per year.
+# is read, and the listing is only kept as totals per year. Section 6
+# re-reads the plan, keeping full rows for at most table_cap files per reason.
 #
-# Install once: install.packages(c("readr", "dplyr", "tidyr", "ggplot2", "scales", "forcats", "patchwork", "jsonlite"))
+# Install once: install.packages(c("readr", "dplyr", "tidyr", "ggplot2", "scales", "forcats", "patchwork", "jsonlite", "reactable", "htmlwidgets"))
 
 # ---- 0. Setup (run once) -----------------------------------------------------
 
@@ -34,6 +35,8 @@ library(scales)
 library(forcats)
 library(patchwork)
 library(jsonlite)
+library(reactable)
+library(htmlwidgets)
 
 # Configuration. Same pattern as the other R scripts: the block for the
 # volume you want goes last (later assignments win).
@@ -67,6 +70,7 @@ plan_path <- resolve_plan(plan_path)
 
 top_n      <- 15        # folders shown in the "top" charts
 chunk_rows <- 500000    # rows read at a time (memory vs. speed)
+table_cap  <- 500       # files per reason in the interactive table (the largest ones)
 
 # Plot style: validated default palette (light mode), categorical slots in
 # fixed order, ink for all text, hairline grid.
@@ -116,6 +120,56 @@ export_plot <- function(plot, name, width = 10, height = 6) {
   path <- file.path(output_folder, paste0(name, ".png"))
   ggsave(path, plot, width = width, height = height, dpi = 150, bg = surface)
   cat(sprintf("Saved: %s\n", path))
+}
+
+# Interactive table, one group per reason (click a group to open it): sort
+# by any column, filter each column, or search them all. `group` holds the
+# group's title. Shown in the Viewer; export_table() saves it as a web page.
+files_table <- function(rows, title, subtitle, group_name = "Reason") {
+  mono <- list(fontFamily = "Consolas, monospace", fontSize = "12px")
+  known <- list(
+    group         = colDef(name = group_name, minWidth = 380,
+                           grouped = JS("function(cell) { return cell.value }")),  # the title has the totals
+    file          = colDef(name = "File", minWidth = 220),
+    folder        = colDef(name = "Folder (under the root)", minWidth = 280, style = mono),
+    size_mb       = colDef(name = "Size (MB)", minWidth = 90, format = colFormat(digits = 1, separators = TRUE)),
+    modified      = colDef(name = "Modified (UTC)", minWidth = 150),
+    category      = colDef(name = "Category", minWidth = 90),
+    copies        = colDef(name = "Copies", minWidth = 70),
+    kind          = colDef(name = "Kind", minWidth = 70),
+    role          = colDef(name = "Role", minWidth = 85),
+    md5           = colDef(name = "md5", minWidth = 150, style = mono),
+    original_path = colDef(name = "Original path", minWidth = 450, style = mono),
+    archive_path  = colDef(name = "Archive path", minWidth = 450, style = mono),
+    reason        = colDef(name = "Reason", minWidth = 170),  # the group's, on every row
+    status        = colDef(name = "Status", minWidth = 170),
+    detail        = colDef(name = "Detail", minWidth = 280)
+  )
+  widget <- reactable(
+    rows, groupBy = "group", columns = known[intersect(names(known), names(rows))],
+    filterable = TRUE, searchable = TRUE, resizable = TRUE, striped = TRUE, compact = TRUE, wrap = FALSE,
+    defaultPageSize = 25, showPageSizeOptions = TRUE, pageSizeOptions = c(25, 100, 500),
+    theme = reactableTheme(color = ink, backgroundColor = surface, borderColor = gridcol,
+                           stripedColor = "#f3f2ee", highlightColor = "#ebeae4",
+                           headerStyle = list(color = ink2), style = list(fontFamily = "Segoe UI, sans-serif"))
+  )
+  prependContent(widget,
+    htmltools::tags$h3(title, style = sprintf("color:%s;font-family:Segoe UI,sans-serif;margin:8px 0 2px", ink)),
+    htmltools::tags$p(subtitle, style = sprintf("color:%s;font-family:Segoe UI,sans-serif;margin:0 0 10px;white-space:pre-line", ink2)))
+}
+
+# Save an interactive table as <output_folder>/<name>.html. A single file
+# needs pandoc (RStudio comes with it); without it, the page's scripts go in
+# a <name>_files folder next to it - keep the two together.
+export_table <- function(widget, name) {
+  dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
+  path <- file.path(output_folder, paste0(name, ".html"))
+  single <- tryCatch({
+    saveWidget(widget, path, selfcontained = TRUE, title = name, background = surface)
+    TRUE
+  }, error = function(e) FALSE)
+  if (!single) saveWidget(widget, path, selfcontained = FALSE, title = name, background = surface)
+  cat(sprintf("Saved: %s%s\n", path, if (single) "" else sprintf(" (+ folder %s_files: pandoc not found)", name)))
 }
 
 # Two bars (Files, Space), each split 100% by `fill_column`.
@@ -398,3 +452,50 @@ if (nrow(skips) > 0) {
   export_plot(p_skips, "archive_skips", width = 12, height = 4)
 }
 write_csv(skips %>% mutate(gb = round(gb, 3)), file.path(output_folder, "archive_skips.csv"))
+
+# ---- 6. What stays in the date range: the files, per reason (interactive table) ----
+# The files behind section 5's bars: one group per reason, with each file's
+# path, detail, size and date. Re-reads the plan for them, keeping only the
+# table_cap largest files per reason; each group's title counts all of them.
+
+largest_per_reason <- function(x) {
+  x %>% group_by(reason) %>% slice_max(size_bytes, n = table_cap, with_ties = FALSE) %>% ungroup()
+}
+cat(sprintf("Reading the skipped files from the plan (up to %s per reason) ...\n", fmt_files(table_cap)))
+stay_rows <- read_csv_chunked(
+  plan_path,
+  DataFrameCallback$new(function(x, pos) {
+    x %>% filter(action == "SKIP", kind %in% c("file", "system", "note")) %>%
+      mutate(size_bytes = coalesce(suppressWarnings(as.numeric(size_bytes)), 0)) %>%
+      largest_per_reason()
+  }),
+  chunk_size = chunk_rows, na = character(),
+  col_types = cols_only(
+    action = col_character(), reason = col_character(), detail = col_character(), kind = col_character(),
+    role = col_character(), category = col_character(), copies = col_character(), md5 = col_character(),
+    size_bytes = col_character(), modified = col_character(), original_path = col_character()
+  )
+) %>% largest_per_reason()
+
+if (nrow(stay_rows) > 0) {
+  stay_groups <- files_in_plan %>%
+    filter(action == "SKIP") %>%
+    group_by(reason) %>%
+    summarise(files = n(), gb = sum(size_bytes) / 2^30, .groups = "drop") %>%
+    mutate(group = sprintf("%s: %s file(s), %s%s", reason, fmt_files(files), fmt_size(gb),
+                           ifelse(files > table_cap, sprintf(" (the %s largest shown)", fmt_files(table_cap)), "")))
+  stay_table <- stay_rows %>%
+    inner_join(stay_groups, by = "reason") %>%
+    arrange(desc(files), reason, desc(size_bytes)) %>%
+    transmute(group, file = sub("^.*\\\\", "", original_path), folder = rel_dir(original_path),
+              size_mb = size_bytes / 2^20, modified, category, copies, kind, role, md5, original_path,
+              reason, detail)
+  t_stays <- files_table(
+    stay_table,
+    title    = "Files in the date range that stay, per reason",
+    subtitle = sprintf("%s\nClick a reason to see its files. CATEGORY_NOT_SELECTED and EXCLUDED_PATTERN can be switched to MOVE in the plan; the others can't. | %s",
+                       selection, basename(plan_path))
+  )
+  print(t_stays)
+  export_table(t_stays, "archive_skips_files")
+}

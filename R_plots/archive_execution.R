@@ -16,8 +16,10 @@
 # Memory: on a large volume these files have one row per moved file, so
 # they're read in chunks and each chunk is reduced to a few small columns
 # (paths become their top folder; only problem rows keep their full path).
+# Section 7 re-reads the results and the verify report, keeping full rows for
+# at most table_cap rows per status.
 #
-# Install once: install.packages(c("readr", "dplyr", "tidyr", "ggplot2", "scales", "forcats", "patchwork", "jsonlite"))
+# Install once: install.packages(c("readr", "dplyr", "tidyr", "ggplot2", "scales", "forcats", "patchwork", "jsonlite", "reactable", "htmlwidgets"))
 
 # ---- 0. Setup (run once) -----------------------------------------------------
 
@@ -29,6 +31,8 @@ library(scales)
 library(forcats)
 library(patchwork)
 library(jsonlite)
+library(reactable)
+library(htmlwidgets)
 
 # Configuration. The block for the volume you want goes last (later
 # assignments win). plan_path: the plan that was EXECUTED (placeholders
@@ -64,6 +68,7 @@ plan_path <- resolve_plan(plan_path)
 top_n      <- 15        # folders / problem types shown in the "top" charts
 chunk_rows <- 500000    # rows read at a time (memory vs. speed)
 run_gap_minutes <- 15   # a pause longer than this in the journal starts a new run
+table_cap  <- 500       # rows per status in the interactive table (the largest files)
 
 prefix <- file.path(reports_folder, tools::file_path_sans_ext(basename(plan_path)))
 inputs <- c(
@@ -141,6 +146,56 @@ export_plot <- function(plot, name, width = 10, height = 6) {
   cat(sprintf("Saved: %s\n", path))
 }
 
+# Interactive table, one group per status (click a group to open it): sort
+# by any column, filter each column, or search them all. `group` holds the
+# group's title. Shown in the Viewer; export_table() saves it as a web page.
+files_table <- function(rows, title, subtitle, group_name = "Status") {
+  mono <- list(fontFamily = "Consolas, monospace", fontSize = "12px")
+  known <- list(
+    group         = colDef(name = group_name, minWidth = 380,
+                           grouped = JS("function(cell) { return cell.value }")),  # the title has the totals
+    file          = colDef(name = "File", minWidth = 220),
+    folder        = colDef(name = "Folder (under the root)", minWidth = 280, style = mono),
+    size_mb       = colDef(name = "Size (MB)", minWidth = 90, format = colFormat(digits = 1, separators = TRUE)),
+    modified      = colDef(name = "Modified (UTC)", minWidth = 150),
+    category      = colDef(name = "Category", minWidth = 90),
+    copies        = colDef(name = "Copies", minWidth = 70),
+    kind          = colDef(name = "Kind", minWidth = 70),
+    role          = colDef(name = "Role", minWidth = 85),
+    md5           = colDef(name = "md5", minWidth = 150, style = mono),
+    original_path = colDef(name = "Original path", minWidth = 450, style = mono),
+    archive_path  = colDef(name = "Archive path", minWidth = 450, style = mono),
+    reason        = colDef(name = "Reason", minWidth = 170),  # the group's, on every row
+    status        = colDef(name = "Status", minWidth = 170),
+    detail        = colDef(name = "Detail", minWidth = 280)
+  )
+  widget <- reactable(
+    rows, groupBy = "group", columns = known[intersect(names(known), names(rows))],
+    filterable = TRUE, searchable = TRUE, resizable = TRUE, striped = TRUE, compact = TRUE, wrap = FALSE,
+    defaultPageSize = 25, showPageSizeOptions = TRUE, pageSizeOptions = c(25, 100, 500),
+    theme = reactableTheme(color = ink, backgroundColor = surface, borderColor = gridcol,
+                           stripedColor = "#f3f2ee", highlightColor = "#ebeae4",
+                           headerStyle = list(color = ink2), style = list(fontFamily = "Segoe UI, sans-serif"))
+  )
+  prependContent(widget,
+    htmltools::tags$h3(title, style = sprintf("color:%s;font-family:Segoe UI,sans-serif;margin:8px 0 2px", ink)),
+    htmltools::tags$p(subtitle, style = sprintf("color:%s;font-family:Segoe UI,sans-serif;margin:0 0 10px;white-space:pre-line", ink2)))
+}
+
+# Save an interactive table as <output_folder>/<name>.html. A single file
+# needs pandoc (RStudio comes with it); without it, the page's scripts go in
+# a <name>_files folder next to it - keep the two together.
+export_table <- function(widget, name) {
+  dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
+  path <- file.path(output_folder, paste0(name, ".html"))
+  single <- tryCatch({
+    saveWidget(widget, path, selfcontained = TRUE, title = name, background = surface)
+    TRUE
+  }, error = function(e) FALSE)
+  if (!single) saveWidget(widget, path, selfcontained = FALSE, title = name, background = surface)
+  cat(sprintf("Saved: %s%s\n", path, if (single) "" else sprintf(" (+ folder %s_files: pandoc not found)", name)))
+}
+
 # Path relative to the root; its folder (file name dropped); first two folder levels.
 rel_path   <- function(paths) substring(paths, prefix_len)
 rel_dir    <- function(paths) {
@@ -165,6 +220,11 @@ folder_class <- function(status) case_when(
 note_class <- function(status) case_when(
   status %in% c("NOTE_UPDATED", "KEEPER_NOT_MOVED") ~ "Note updated or not needed",
   TRUE                                              ~ "Problem"  # NOTE_MISSING, NOTE_FAILED, ERROR
+)
+row_class <- function(kind, status) case_when(
+  kind == "folder"      ~ folder_class(status),
+  kind == "keeper_note" ~ note_class(status),
+  TRUE                  ~ execute_class(status)
 )
 verify_class <- function(status) case_when(
   status == "OK"                 ~ "Verified OK",
@@ -192,9 +252,7 @@ get_results <- function() cached("results", function() {
   cat(sprintf("Reading %s ...\n", basename(inputs[["results"]])))
   read_csv_chunked(need("results"), DataFrameCallback$new(function(x, pos) {
     is_folder <- x$kind == "folder"
-    class     <- case_when(is_folder ~ folder_class(x$status),
-                           x$kind == "keeper_note" ~ note_class(x$status),
-                           TRUE ~ execute_class(x$status))
+    class     <- row_class(x$kind, x$status)
     keep      <- class %in% c("Problem", "Folder kept")
     tibble(
       status = x$status, class = class, kind = x$kind,
@@ -499,3 +557,80 @@ p_space <- hbar(top_space, "gb", "folder", fmt_size(top_space$gb), sprintf("Top 
   )
 print(p_space)
 export_plot(p_space, "archive_execution_space_by_folder", width = 13, height = 6)
+
+# ---- 7. What wasn't moved, or failed verification, per status (interactive table) ----
+# The rows behind sections 1, 3, 4 and 5: everything the last execute run
+# didn't move (skipped by a safety check, failed, kept folders, quarantine
+# notes not updated) and every problem verify found, with path, detail, size
+# and date. One group per status; re-reads the results and the verify report,
+# keeping the table_cap largest rows per status; each group's title counts
+# all of them.
+
+success <- c("Moved", "Folder removed", "Note updated or not needed")
+what_of <- function(kind) case_when(kind == "folder" ~ "folder(s)", kind == "keeper_note" ~ "quarantine note(s)",
+                                    TRUE ~ "file(s)")
+largest_per_status <- function(x) {
+  x %>% group_by(source, status, what) %>% slice_max(size_bytes, n = table_cap, with_ties = FALSE) %>% ungroup()
+}
+read_largest <- function(path, rows_of, columns) {
+  cat(sprintf("Reading %s (up to %s rows per status) ...\n", basename(path), fmt_files(table_cap)))
+  read_csv_chunked(path, DataFrameCallback$new(function(x, pos) largest_per_status(rows_of(x))),
+                   chunk_size = chunk_rows, na = character(), col_types = columns) %>% largest_per_status()
+}
+number <- function(x) suppressWarnings(as.numeric(x))
+
+detail_rows <- read_largest(need("results"), function(x) {
+  x %>% filter(!row_class(kind, status) %in% success) %>%
+    transmute(source = "execute", status, what = what_of(kind), detail, kind,
+              size_bytes = coalesce(number(size_bytes), 0), modified, md5, original_path, archive_path)
+}, cols_only(status = col_character(), detail = col_character(), kind = col_character(), md5 = col_character(),
+             size_bytes = col_character(), modified = col_character(), original_path = col_character(),
+             archive_path = col_character()))
+totals <- get_results() %>%
+  filter(!class %in% success) %>%
+  group_by(source = "execute", status, what = what_of(kind), class) %>%
+  summarise(n = n(), gb = sum(size_bytes, na.rm = TRUE) / 2^30, .groups = "drop")
+
+if (file.exists(inputs[["verify"]])) {
+  detail_rows <- bind_rows(detail_rows, read_largest(inputs[["verify"]], function(x) {
+    x %>% filter(kind != "folder", verify_class(status) == "Problem") %>%
+      transmute(source = "verify", status, what = "file(s)", detail, kind,
+                size_bytes = coalesce(number(size_bytes), number(size_found), 0),  # EXTRA rows: size found
+                modified = mtime_original, md5 = md5_expected, original_path, archive_path)
+  }, cols_only(status = col_character(), detail = col_character(), kind = col_character(),
+               md5_expected = col_character(), size_bytes = col_character(), size_found = col_character(),
+               mtime_original = col_character(), original_path = col_character(), archive_path = col_character())))
+  totals <- bind_rows(totals, get_verify() %>%
+    filter(class == "Problem") %>%
+    group_by(source = "verify", status, what = "file(s)", class) %>%
+    summarise(n = n(), gb = sum(size_bytes, na.rm = TRUE) / 2^30, .groups = "drop"))
+}
+print(totals %>% arrange(desc(n)), n = Inf)
+
+if (nrow(detail_rows) > 0) {
+  # Problems first, then what a safety check skipped, then what stayed with a kept folder.
+  rank_of <- c("Problem", "Skipped by a safety check", "Stayed: folder kept", "Folder kept")
+  totals <- totals %>%
+    mutate(rank = match(class, rank_of),
+           group = sprintf("%s (%s): %s %s%s%s", status, source, fmt_files(n), what,
+                           ifelse(gb > 0, paste0(", ", fmt_size(gb)), ""),
+                           ifelse(n > table_cap, sprintf(" (the %s largest shown)", fmt_files(table_cap)), "")))
+  not_moved_table <- detail_rows %>%
+    inner_join(totals, by = c("source", "status", "what")) %>%
+    arrange(rank, desc(n), group, desc(size_bytes)) %>%
+    transmute(group, file = sub("^.*\\\\", "", original_path), folder = rel_dir(original_path),
+              size_mb = size_bytes / 2^20, modified, kind, md5, original_path, archive_path,
+              status = sprintf("%s (%s)", status, source), detail)
+  t_not_moved <- files_table(
+    not_moved_table,
+    title    = "What wasn't moved, or failed verification, per status",
+    subtitle = sprintf(paste0("Click a status to see its rows. execute: the last execute run; verify: move_to_archive checked against the plan. ",
+                              "Re-run execute (or execute --retry-failed) once a cause is fixed. | label: %s | %s"),
+                       label, paste(basename(inputs[file.exists(inputs) & names(inputs) %in% c("results", "verify")]),
+                                    collapse = " + "))
+  )
+  print(t_not_moved)
+  export_table(t_not_moved, "archive_execution_not_moved")
+} else {
+  cat("Every row of the last execute run was moved, and verify found no problems.\n")
+}
