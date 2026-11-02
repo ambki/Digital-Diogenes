@@ -59,6 +59,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
   - [Input: which listing to use](#input-which-listing-to-use)
   - [Usage](#usage-3)
   - [Skip reasons and statuses](#skip-reasons-and-statuses)
+  - [Missing files: gone duplicates or a problem?](#missing-files-gone-duplicates-or-a-problem)
   - [Arguments](#arguments-3)
   - [Output files](#output-files)
   - [Generating test data](#generating-test-data-2)
@@ -1524,6 +1525,7 @@ section's last line exports its plot into `output_folder`:
 | 3. By category | unique / keeper / duplicate / unreadable in the date range, moving vs staying | `archive_by_category.png` |
 | 4. Top folders | The folders (two levels under the root) with the most space and files to move, and the number of folders to remove | `archive_top_folders.png` |
 | 5. Skips | Files in the range that stay, per reason | `archive_skips.png`, `archive_skips.csv` |
+| 6. Skipped files (interactive) | The files behind section 5, one group per reason (click to open): file, folder, size, date, category, md5, path, reason and detail. Sort, filter per column or search. Keeps the `table_cap` largest files per reason (default 500; each group's title counts all of them) | `archive_skips_files.html` |
 
 Sections 1 and 2 read the plan's listing (only once, kept as totals per
 year), so they take longest on a large volume.
@@ -1595,6 +1597,13 @@ too) and `output_folder`, run
 | 4. Problems | What execute couldn't do (e.g. `MOVE_FAILED: PermissionError`), by type and by folder | `_execute_results.csv` | `archive_execution_problems.png`, `archive_execution_problems.csv` |
 | 5. Folders | Emptied folders removed vs kept, why they were kept, and the quarantine notes updated | `_execute_results.csv` | `archive_execution_folders.png`, `archive_execution_kept_folders.csv` |
 | 6. Moved per folder | What is in `move_to_archive` now, per original folder (net of restores) | `_journal.csv` + `_undo_journal.csv` | `archive_execution_space_by_folder.png` |
+| 7. Not moved (interactive) | Every row execute didn't move (problems, safety-check skips, kept folders, quarantine notes not updated) and every verify problem, one group per status (click to open): file, folder, size, date, paths, status and detail. Keeps the `table_cap` largest rows per status (default 500) | `_execute_results.csv` + `_verify_report.csv` | `archive_execution_not_moved.html` |
+
+The interactive tables need `reactable` and `htmlwidgets`
+(`install.packages(c("reactable", "htmlwidgets"))`). They show in the RStudio
+Viewer and are saved as one HTML file you can open later without R. Outside
+RStudio, without pandoc, the page comes with a `<name>_files` folder; keep the
+two together. Like the CSVs, they hold the real paths of the storage.
 
 For the storage as a whole, before and after:
 [`storage_report_by_year.R`](R_plots/storage_report_by_year.R) works
@@ -1623,10 +1632,90 @@ files are back with identical paths, md5s and mtimes.
 | `EXCLUDED_PATTERN` | matches `--exclude` |
 | `MTIME_UNKNOWN` | the scan couldn't stat the file (its mtime reads as 1970-01-01), so its age is unknown |
 | `GIT_PARTIAL` | in a `.git` folder whose files aren't all selected |
-| `FILE_MISSING` / `FILE_CHANGED` / `FILE_UNREADABLE` | the file is gone or differs from the listing (pre-flight, or `SKIPPED_…` in execute) |
+| `FILE_MISSING` / `FILE_CHANGED` / `FILE_UNREADABLE` | the file is gone or differs from the listing (pre-flight, or `SKIPPED_…` in execute); for missing files, see [Missing files](#missing-files-gone-duplicates-or-a-problem) |
 | `FOLDER_KEPT` (execute) | the folder still holds files, a follower is set to `SKIP`, or the quarantine isn't finalized; `detail` says which |
 | `KEEPER_NOT_MOVED` (execute) | the keeper of a quarantine note wasn't moved, so the note wasn't changed |
 | `CONFLICT`, `MISSING`, `MOVED_RESUMED`, `ALREADY_MOVED` | as in quarantine_duplicates.py's *Resuming* table |
+
+### Missing files: gone duplicates or a problem?
+
+`FILE_MISSING` means the plan selected a file (in the date range, in a chosen
+category) that the listing has but the storage doesn't. Files that weren't
+selected are never checked, so they never show up as missing. Nothing is
+moved or deleted for these rows, but each one deserves an explanation.
+
+**The usual cause: a quarantine the listing doesn't know about.** A plan only
+knows its listing, and `<plan>_remaining_raw.csv` only subtracts what *this*
+script moved. Take a listing made before a quarantine, or chained from one
+made before it:
+
+1. Batch 1 archives a group's keeper `A`. Its duplicate `B` isn't selected
+   (category `duplicate`), so nobody notices that `quarantine_duplicates.py`
+   has already moved `B` into `<root>\duplicates`.
+2. Batch 2 reads batch 1's remaining listing. That listing still has `B`,
+   and no longer has `A`, which is on tape. Categories are recomputed from the
+   listing, so `B`, now the oldest copy left, becomes the `keeper`. It's
+   selected, and the pre-flight check finds it gone: `FILE_MISSING`.
+
+`B` is safe: it's in `duplicates\`, and its content is on tape as `A`. To
+avoid it, after a quarantine plan from that quarantine's remaining listing
+(`quarantine_duplicates.py remaining`), or from a rescan, not from an older
+listing. Files removed by users or other tools give `FILE_MISSING` the same
+way.
+
+**Checking them in R:
+[`archive_missing_check.R`](R_plots/archive_missing_check.R).** For each
+missing file, it finds out where the file went and whether its content is
+still safe somewhere: on tape, on the storage, or in `duplicates\`.
+
+Missing files come from two places:
+- **The plan's `FILE_MISSING` rows:** missing when the plan was made.
+- **The execute results:** `MISSING` or `SKIPPED_FILE_MISSING`, for files
+  gone between the plan and execute.
+
+A path that is missing in several chained plans counts once.
+
+Inputs (set the first three in the configuration block):
+
+| Setting / file | What it is | Used for |
+|---|---|---|
+| `plan_path` | One or more archive plans. A wildcard (`archive_plan_*.csv`) takes **every** plan in that folder, e.g. all year-by-year batches; for plans in several folders, give a vector: `c(r"(...)", r"(...)")` | the missing files, plus `<plan>_execute_results.csv` next to each plan, if executed |
+| `quarantine_journal` | The quarantine's `move_plan_<ts>_journal.csv`, one or more, wildcards allowed (`move_plan_*_journal.csv`); its `_undo_journal.csv` is found automatically. `NA` if there was no quarantine | whether the quarantine moved the file, to which `duplicates_path`, and its `keeper_path` |
+| `duplicates_raw` | Optional: the duplicates_check.py `_raw.csv` the quarantine was planned from | whether the file was the keeper (oldest copy) in that run |
+| `<root>\_archived_to_tape.csv` | Found from each plan's settings | what's on tape: path, md5, date, label |
+| Each plan's listing | The `raw_csv` in its settings (e.g. the previous `_remaining_raw.csv`) | other copies of the same content on the storage |
+
+Each input is read in chunks, keeping only the rows that match a missing
+file's path or md5, so even a large volume takes little time and memory. Only
+the few paths involved are checked on disk: the keepers, the quarantined
+copies, and up to `max_checks` other copies per content (default 20, oldest
+first). Run section **0. Setup**, then sections 1 and 2:
+
+| Verdict | Meaning |
+|---|---|
+| **OK:** quarantined, its keeper is on tape | the expected case: a duplicate the quarantine moved, whose keeper went to tape in an earlier batch |
+| **OK:** quarantined, its keeper is on the storage | a quarantined duplicate whose keeper is still in place |
+| **CHECK:** quarantined, its keeper not found, but a copy exists | the keeper moved or was removed outside the scripts; the content is still on tape, on the storage or in `duplicates\` |
+| **CHECK:** was the duplicates run's keeper, removed outside the scripts; a copy exists | needs `duplicates_raw`: a real keeper disappeared, but its content survives elsewhere |
+| **CHECK:** not quarantined (removed outside the scripts); a copy exists | deleted or moved by a user or another tool; the content survives |
+| **ALERT:** no copy of its content found | not on tape, not on the storage, not in `duplicates\`: look into it |
+| **ALERT:** no md5, can't be checked | the listing had no md5 for it |
+
+The table also shows, for each file:
+- where it was quarantined to, and whether that copy is still there (it's
+  gone once the quarantine is finalized and `duplicates` deleted)
+- its keeper and where that keeper is now (with the tape label)
+- the oldest copy on tape and on the storage
+- where the oldest copy of the content is now (`on tape`, `this file`, or
+  `on the storage`)
+
+| Section | What it shows | Exported as |
+|---|---|---|
+| 1. Verdicts | Missing files per verdict (OK / CHECK / ALERT) | `archive_missing_check.png` |
+| 2. Missing files (interactive + CSV) | One group per verdict, ALERTs first (click to open), with the columns above; sort, filter per column, or search | `archive_missing_check.html`, `archive_missing_check.csv` |
+
+`<plan>_execute_results.csv` is looked for in the plan's folder, which is
+where execute writes it unless you gave it another `--output`.
 
 ### Arguments
 
