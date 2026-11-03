@@ -1771,7 +1771,7 @@ gives the exact command for step 2.
 |---|---|---|
 | 1. Verdicts | Missing files per verdict (OK / CHECK / ALERT) | `archive_missing_check.png` |
 | 2. Missing files (interactive + CSVs) | One group per verdict, ALERTs first (click to open), with the columns above; sort, filter per column, or search. Also writes the path list for step 2 | `archive_missing_check.html`, `archive_missing_check.csv`, **`archive_missing_paths.csv`** |
-| 3. On the storage (after step 2) | Reads the Python output (set `disk_result`). A chart with one bar per verdict from the records, coloured by the verdict on the storage, so you can see how the records hold up; and a second interactive table, one group per verdict on the storage (ALERTs first), with what was found for each file and the copies found, with their paths | `archive_missing_disk.png`, `archive_missing_disk.html` |
+| 3. On the storage (after step 2) | Reads the Python output (set `disk_result`). A chart with one bar per verdict from the records, coloured by the verdict on the storage, so you can see how the records hold up; and a second interactive table, one group per verdict on the storage (ALERTs first), with what was found for each file and the copies found, with their paths | `archive_missing_disk.png`, `archive_missing_disk.html`, saved into the `disk_result` folder, next to the Python results (not into `output_folder`) |
 
 `archive_missing_paths.csv` has one row per path to confirm, for each missing
 file:

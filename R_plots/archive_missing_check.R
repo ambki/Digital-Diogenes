@@ -91,13 +91,6 @@ library(htmlwidgets)
 #                  path doesn't exist on this machine (Setup then prints
 #                  "NOTE: listing not found"). Without a listing, the other
 #                  copies of each content aren't known.
-#   disk_result    The FOLDER with the results of
-#                  support_scripts\check_missing_on_disk.py
-#                  (archive_missing_disk.csv and archive_missing_disk_paths.csv,
-#                  with those names; by default it writes them next to the
-#                  path list, i.e. into output_folder). Only section 3
-#                  uses it: run sections 0-2, then the Python script on the
-#                  storage, then set this and run section 3.
 
 ##Volume A
 plan_path          <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry\archive_plan_*.csv)"  # REQUIRED
@@ -106,16 +99,6 @@ output_folder      <- r"(C:\path\to\storage_analysis\Volume_A\archive_dry)"     
 quarantine_journal <- r"(C:\path\to\storage_analysis\Volume_A\quarantine\move_plan_*_journal.csv)"  # OPTIONAL (NA = none)
 duplicates_raw     <- NA                                                                       # OPTIONAL (NA = none)
 listing_path       <- NA                                                                       # OPTIONAL (NA = raw_csv from the plans' settings)
-disk_result        <- NA                                                                       # OPTIONAL: a folder (NA = section 3 skipped)
-
-##Volume B
-plan_path          <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry\archive_plan_*.csv)"  # REQUIRED
-tape_index         <- NA                                                                       # REQUIRED (NA = <root>\_archived_to_tape.csv)
-output_folder      <- r"(C:\path\to\storage_analysis\Volume_B\archive_dry)"                    # REQUIRED
-quarantine_journal <- r"(C:\path\to\storage_analysis\Volume_B\quarantine\move_plan_*_journal.csv)"  # OPTIONAL (NA = none)
-duplicates_raw     <- NA                                                                       # OPTIONAL (NA = none)
-listing_path       <- NA                                                                       # OPTIONAL (NA = raw_csv from the plans' settings)
-disk_result        <- NA                                                                       # OPTIONAL: a folder (NA = section 3 skipped)
 
 chunk_rows <- 500000    # rows read at a time (memory vs. speed)
 max_paths  <- 20        # other copies per content put in the path list for the disk check (oldest first)
@@ -168,19 +151,21 @@ theme_check <- theme_minimal(base_size = 11) +
   )
 fmt_files <- label_comma()
 
-export_plot <- function(plot, name, width = 10, height = 6) {
-  dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
-  path <- file.path(output_folder, paste0(name, ".png"))
+# Save a plot as <folder>/<name>.png (folder: output_folder unless given).
+export_plot <- function(plot, name, width = 10, height = 6, folder = output_folder) {
+  dir.create(folder, showWarnings = FALSE, recursive = TRUE)
+  path <- file.path(folder, paste0(name, ".png"))
   ggsave(path, plot, width = width, height = height, dpi = 150, bg = surface)
   cat(sprintf("Saved: %s\n", path))
 }
 
-# Save an interactive table as <output_folder>/<name>.html. A single file
-# needs pandoc (RStudio comes with it); without it, the page's scripts go in
-# a <name>_files folder next to it - keep the two together.
-export_table <- function(widget, name) {
-  dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
-  path <- file.path(output_folder, paste0(name, ".html"))
+# Save an interactive table as <folder>/<name>.html (folder: output_folder
+# unless given). A single file needs pandoc (RStudio comes with it); without
+# it, the page's scripts go in a <name>_files folder next to it - keep the two
+# together.
+export_table <- function(widget, name, folder = output_folder) {
+  dir.create(folder, showWarnings = FALSE, recursive = TRUE)
+  path <- file.path(folder, paste0(name, ".html"))
   single <- tryCatch({
     saveWidget(widget, path, selfcontained = TRUE, title = name, background = surface)
     TRUE
@@ -507,7 +492,17 @@ cat("Then set disk_result to the folder with its results and run section 3.\n")
 # archive_missing_disk_paths.csv, written by
 # support_scripts\check_missing_on_disk.py from section 2's path list on a
 # machine that reaches the storage. Shows how the records' verdicts (sections
-# 1-2) hold up on the storage, and which copies were found where.
+# 1-2) hold up on the storage, and which copies were found where. Its chart
+# and table are saved into that same folder, next to the Python results.
+#   disk_result    The FOLDER with the results of
+#                  support_scripts\check_missing_on_disk.py
+#                  (archive_missing_disk.csv and archive_missing_disk_paths.csv,
+#                  with those names; by default it writes them next to the
+#                  path list, i.e. into output_folder). Only section 3
+#                  uses it: run sections 0-2, then the Python script on the
+#                  storage, then set this and run section 3.
+
+disk_result        <- NA                                                                       # OPTIONAL: a folder (NA = section 3 skipped)
 
 if (all(is.na(disk_result))) stop("Set disk_result to the folder with the results of check_missing_on_disk.py first (see section 2).")
 disk_folder <- if (grepl("\\.csv$", disk_result, ignore.case = TRUE)) dirname(disk_result) else disk_result  # a file: its folder
@@ -564,7 +559,7 @@ p_disk <- ggplot(compared %>% count(verdict, disk_class, name = "files") %>%
        x = NULL, y = NULL) +
   theme_check
 print(p_disk)
-export_plot(p_disk, "archive_missing_disk", width = 12, height = 4)
+export_plot(p_disk, "archive_missing_disk", width = 12, height = 4, folder = disk_folder)
 
 disk_rows <- compared %>%
   add_count(disk_class, name = "n") %>%
@@ -612,4 +607,4 @@ t_disk <- reactable(
                     style = note_style)
 )
 print(t_disk)
-export_table(t_disk, "archive_missing_disk")
+export_table(t_disk, "archive_missing_disk", folder = disk_folder)
