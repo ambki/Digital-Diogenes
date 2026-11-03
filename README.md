@@ -14,8 +14,11 @@ below, in the order they are used:
 | 3. Archive | [`archive_old_files.py`](#archive_old_filespy) | Moves the files modified in a date range into a `move_to_archive` folder (same folder structure), ready to be copied to tape by hand. Scans the storage itself, or reuses the newest raw listing. |
 | When needed | [`change_folder_permissions.py`](#change_folder_permissionspy) | Standalone, run by hand: gives an account Modify on a folder tree (e.g. when `execute` fails with *Access is denied*), later reduces everyone else to read only, and restores the previous permissions. |
 
-The R scripts used for reporting live in [`R_plots/`](R_plots/), and the
-scripts that generate test data live in [`support_scripts/`](support_scripts/).
+The R scripts used for reporting live in [`R_plots/`](R_plots/). The
+scripts that generate test data live in [`support_scripts/`](support_scripts/),
+together with `check_missing_on_disk.py`, which confirms on the storage what
+`archive_missing_check.R` found in the records (see
+[Missing files](#missing-files-gone-duplicates-or-a-problem)).
 
 The whole pipeline has been positively tested in WindowsOS 11 in storage volumes up to 40 Tbs of size. Nevertheless, it can work in linux systems as well and for bigger storage sizes. 
 
@@ -1275,14 +1278,40 @@ and `undo`.
 ### Workflow at a glance
 
 ```
-archive_old_files.py plan     → (scans + hashes the storage, unless --raw-csv is given)
-                              → archive_plan_<timestamp>.csv  (dry run, review it)
-archive_old_files.py execute  → moves, notes, removes emptied folders, manifest, root index,
-                                then verify and <plan>_remaining_raw.csv
-   (copy move_to_archive to tape, check it with archive_manifest.csv, delete move_to_archive)
-archive_old_files.py verify   → (optional) re-run the md5 check alone
-archive_old_files.py undo     → (optional) put everything back
+1. archive_old_files.py plan     → (scans + hashes the storage, unless --raw-csv is given)
+                                 → archive_plan_<timestamp>.csv  (dry run)
+2. R_plots/archive_plan.R        → review the plan: what moves, per year, category and folder,
+                                   and what stays and why (incl. the files of each skip reason)
+3. archive_old_files.py execute  → moves, notes, removes emptied folders, manifest, root index,
+                                   then verify and <plan>_remaining_raw.csv
+4. R_plots/archive_execution.R   → what execute did: outcome, progress, verification,
+                                   problems, folders (incl. the rows that weren't moved)
+
+   If plans or execute report missing files (FILE_MISSING / MISSING):
+5. R_plots/archive_missing_check.R, sections 0-2  → verdicts from the records only (any machine)
+                                                   + archive_missing_paths.csv
+6. support_scripts/check_missing_on_disk.py       → where the storage is reachable: are those
+     --paths archive_missing_paths.csv               paths really there? → archive_missing_disk*.csv
+7. R_plots/archive_missing_check.R, section 3     → set disk_result to that folder: the records'
+                                                   verdicts next to what was found on the storage
+
+8. Only once the analysis is done: copy move_to_archive to tape, check it with
+   archive_manifest.csv, then delete move_to_archive
+
+   When needed (before step 8):
+   archive_old_files.py verify   → re-run the md5 check alone
+   archive_old_files.py undo     → put everything back
 ```
+
+Steps 2, 4 and 5–7 are optional reporting and checks; they read the files the
+Python script writes and change nothing. Steps 5–7 are explained in
+[Missing files](#missing-files-gone-duplicates-or-a-problem). Keep
+`move_to_archive` until they're done: as long as it's there, `undo` can still
+put everything back, and nothing has been lost if the checks find a problem.
+The next `plan` refuses to start while `move_to_archive` still holds files, so
+step 8 comes before the next batch. For that batch, plan from the
+`<plan>_remaining_raw.csv` of step 3 (see
+[Input: which listing to use](#input-which-listing-to-use)).
 
 The archive step is self-contained: without `--raw-csv`, `plan` scans and
 hashes the storage itself (the same scan as `duplicates_check.py --folder`).
@@ -1563,6 +1592,11 @@ rescan, and it's the input for the next archive or quarantine plan and for
 
 #### 3. Copy to tape
 
+Do this last, once the review is done: the execution report
+(`archive_execution.R`) and, if there were missing files, the
+[missing-files check](#missing-files-gone-duplicates-or-a-problem). Until then
+`undo` can still put everything back.
+
 Copy `<root>\move_to_archive` to tape, check the copy against
 `archive_manifest.csv` (one row per file, with md5), then delete
 `move_to_archive`. The next `plan` refuses to start while `move_to_archive`
@@ -1663,10 +1697,19 @@ avoid it, after a quarantine plan from that quarantine's remaining listing
 listing. Files removed by users or other tools give `FILE_MISSING` the same
 way.
 
-**Checking them in R:
-[`archive_missing_check.R`](R_plots/archive_missing_check.R).** For each
-missing file, it finds out where the file went and whether its content is
-still safe somewhere: on tape, on the storage, or in `duplicates\`.
+**Checking them: two steps.**
+
+1. **[`archive_missing_check.R`](R_plots/archive_missing_check.R), from the
+   records.** It reads only the record files (plans, quarantine journal, tape
+   index, listings) and checks nothing on the storage, so it runs on any
+   machine. For each missing file, it says where the file went and where the
+   records put its content: on tape, in a listing, or in `duplicates\`.
+2. **[`check_missing_on_disk.py`](support_scripts/check_missing_on_disk.py),
+   on the storage.** It takes the path list step 1 writes and checks whether
+   those paths really exist (the keepers, the quarantined copies, the other
+   copies). Run it where the storage is reachable. It's standalone, using only
+   the Python standard library, so the file can be copied on its own to a
+   server.
 
 Missing files come from two places:
 - **The plan's `FILE_MISSING` rows:** missing when the plan was made.
@@ -1675,46 +1718,117 @@ Missing files come from two places:
 
 A path that is missing in several chained plans counts once.
 
+#### Step 1: the records (R)
+
 Inputs (set them in the configuration block, where each line is marked
 `# REQUIRED` or `# OPTIONAL`):
 
 | Setting / file | What it is | Used for |
 |---|---|---|
 | `plan_path` (**required**) | One or more archive plans. A wildcard (`archive_plan_*.csv`) takes **every** plan in that folder, e.g. all year-by-year batches; for plans in several folders, give a vector: `c(r"(...)", r"(...)")` | the missing files, plus `<plan>_execute_results.csv` next to each plan, if executed |
+| `tape_index` (**required**) | The `_archived_to_tape.csv`. `NA` (default) = `<root>\_archived_to_tape.csv`, with the root recorded in each plan's settings; give a path to a copy if the storage isn't reachable from this machine, or if it's now reached by another drive letter or path. The script stops if it isn't found. It's created by the first `execute`, so a plan that was never executed can't be checked yet | what's on tape: path, md5, date, label |
+| `output_folder` (**required**) | Where the chart, table and CSVs are saved | |
 | `quarantine_journal` (optional, strongly recommended after a quarantine) | The quarantine's `move_plan_<ts>_journal.csv`, one or more, wildcards allowed (`move_plan_*_journal.csv`); its `_undo_journal.csv` is found automatically. `NA` if there was no quarantine | whether the quarantine moved the file, to which `duplicates_path`, and its `keeper_path` |
 | `duplicates_raw` (optional) | The duplicates_check.py `_raw.csv` the quarantine was planned from | whether the file was the keeper (oldest copy) in that run |
-| `tape_index` (**required**) | The `_archived_to_tape.csv`. `NA` (default) = `<root>\_archived_to_tape.csv`, with the root recorded in each plan's settings; set it if the storage is now reached by another drive letter or path, or to use a copy. The script stops if it isn't found. It's created by the first `execute`, so a plan that was never executed can't be checked yet | what's on tape: path, md5, date, label |
-| `output_folder` (**required**) | Where the chart, table and CSV are saved | |
-| Each plan's listing (automatic) | The `raw_csv` in its settings (e.g. the previous `_remaining_raw.csv`); if it has moved, the check notes it and runs without it | other copies of the same content on the storage |
+| `disk_result` (optional, for section 3) | The **folder** with the output of step 2: `archive_missing_disk.csv` and `archive_missing_disk_paths.csv`, with those names (by default the Python script writes them next to the path list, i.e. into `output_folder`). `NA` until step 2 has run | section 3 only |
+| `listing_path` (optional) | The listing(s) the plans were made from, wildcards allowed. `NA` (default) = the `raw_csv` recorded in each plan's `_settings.json` (e.g. the previous `_remaining_raw.csv`, or the scan's `_raw.csv`). Give it when that path doesn't exist on this machine: the plan was made elsewhere, or the folder has moved. Setup then prints `NOTE: listing not found …`, and without a listing the other copies of each content aren't known | the other copies of the same content |
 
 Each input is read in chunks, keeping only the rows that match a missing
-file's path or md5, so even a large volume takes little time and memory. Only
-the few paths involved are checked on disk: the keepers, the quarantined
-copies, and up to `max_checks` other copies per content (default 20, oldest
-first). Run section **0. Setup**, then sections 1 and 2:
+file's path or md5, so even a large volume takes little time and memory. Run
+section **0. Setup**, then sections 1 and 2:
 
-| Verdict | Meaning |
+| Verdict (from the records) | Meaning |
 |---|---|
 | **OK:** quarantined, its keeper is on tape | the expected case: a duplicate the quarantine moved, whose keeper went to tape in an earlier batch |
-| **OK:** quarantined, its keeper is on the storage | a quarantined duplicate whose keeper is still in place |
-| **CHECK:** quarantined, its keeper not found, but a copy exists | the keeper moved or was removed outside the scripts; the content is still on tape, on the storage or in `duplicates\` |
-| **CHECK:** was the duplicates run's keeper, removed outside the scripts; a copy exists | needs `duplicates_raw`: a real keeper disappeared, but its content survives elsewhere |
-| **CHECK:** not quarantined (removed outside the scripts); a copy exists | deleted or moved by a user or another tool; the content survives |
-| **ALERT:** no copy of its content found | not on tape, not on the storage, not in `duplicates\`: look into it |
+| **OK:** quarantined, its keeper is in the listing | a quarantined duplicate whose keeper is still listed on the storage |
+| **CHECK:** quarantined, its keeper isn't in the records, but another copy is | the keeper isn't on tape or in the listing; the content is, elsewhere |
+| **CHECK:** quarantined, its quarantined copy is the only one in the records | the copy in `duplicates\` is all that's left: it goes when the quarantine is finalized |
+| **CHECK:** was the duplicates run's keeper, not in the quarantine journal; another copy is in the records | needs `duplicates_raw`: a real keeper disappeared, but its content is elsewhere |
+| **CHECK:** not in the quarantine journal; its content is on tape | removed outside the scripts, or quarantined by a run whose journal isn't given; the content is on tape |
+| **CHECK:** not in the quarantine journal; another copy is in the listing | same, with the content in the listing |
+| **ALERT:** no other copy in the records | not on tape, not in any listing: look into it, starting with step 2 |
 | **ALERT:** no md5, can't be checked | the listing had no md5 for it |
 
 The table also shows, for each file:
-- where it was quarantined to, and whether that copy is still there (it's
-  gone once the quarantine is finalized and `duplicates` deleted)
-- its keeper and where that keeper is now (with the tape label)
-- the oldest copy on tape and on the storage
-- where the oldest copy of the content is now (`on tape`, `this file`, or
-  `on the storage`)
+- where it was quarantined to and its keeper (from the journal), and where
+  that keeper is (`tape: <label>`, `in the listing`, or `not in the records`)
+- the oldest copy on tape, and where the oldest copy of the content is
+  (`on tape`, `this file`, or `on the storage`)
+- whether it was the keeper in the duplicates run (with `duplicates_raw`)
+- **Copies (in the plan's listing):** how many files with that md5 the
+  listing had, this one included
+- **The other copies, per the listings:** e.g.
+  `others listed 2: on the storage 1, also missing 1`
+- **Other copies [listing status]:** their paths, oldest first (up to
+  `max_named`, default 10), each marked `listed on the storage`,
+  `missing too` (in the missing list too, so it doesn't count),
+  `listed in duplicates\`, or `listed in move_to_archive\`
+
+The table's header says that the verdicts come from the records only, and
+gives the exact command for step 2.
 
 | Section | What it shows | Exported as |
 |---|---|---|
 | 1. Verdicts | Missing files per verdict (OK / CHECK / ALERT) | `archive_missing_check.png` |
-| 2. Missing files (interactive + CSV) | One group per verdict, ALERTs first (click to open), with the columns above; sort, filter per column, or search | `archive_missing_check.html`, `archive_missing_check.csv` |
+| 2. Missing files (interactive + CSVs) | One group per verdict, ALERTs first (click to open), with the columns above; sort, filter per column, or search. Also writes the path list for step 2 | `archive_missing_check.html`, `archive_missing_check.csv`, **`archive_missing_paths.csv`** |
+| 3. On the storage (after step 2) | Reads the Python output (set `disk_result`). A chart with one bar per verdict from the records, coloured by the verdict on the storage, so you can see how the records hold up; and a second interactive table, one group per verdict on the storage (ALERTs first), with what was found for each file and the copies found, with their paths | `archive_missing_disk.png`, `archive_missing_disk.html` |
+
+`archive_missing_paths.csv` has one row per path to confirm, for each missing
+file:
+- the file itself (is it back?)
+- its quarantined copy and its keeper (journal)
+- where a quarantine would have put it, if it isn't in the journal
+  (`<root>\duplicates\<its path>`)
+- up to `max_paths` (default 20) other copies, oldest first, each also with
+  its would-be place in `duplicates\`
+
+#### Step 2: on the storage (Python)
+
+Copy `archive_missing_paths.csv` (and the script, if needed) to a machine
+that reaches the storage with the same drive letter or path as in the
+listings, and run:
+
+```powershell
+python support_scripts\check_missing_on_disk.py --paths "C:\path\to\archive_missing_paths.csv"
+```
+
+| Argument | Description |
+|---|---|
+| `--paths` | The `archive_missing_paths.csv` written by `archive_missing_check.R`. Required. |
+| `--output` | Folder for the results. Default: the folder of `--paths`. |
+| `--hash` | Also compute the md5 of every file found, and count a copy only if it matches the expected md5. Slower, since it reads the files. Default: existence only. |
+| `--workers` | Paths checked at the same time. Default: 8. |
+| `--io-timeout` | Seconds to wait for one path before reporting it as an error. Default: 10. |
+
+It's read-only: it only stats the paths (and reads the files with `--hash`).
+Each distinct path is checked once. It writes two CSVs (UTF-8 with BOM, so
+Excel shows the characters right):
+
+- **`archive_missing_disk.csv`:** one row per missing file, worst first:
+  - `record_verdict` and `tape_label` from step 1
+  - what was found on the storage: the file itself back, the keeper, the
+    quarantined copy, other copies on the storage (`found of listed`), copies
+    in `duplicates\`
+  - **`disk_verdict`:**
+
+    | Verdict (on the storage) | Meaning |
+    |---|---|
+    | **OK:** content found: … | on tape, or the file itself, its keeper, or another copy is on the storage; the text lists where |
+    | **CHECK:** only in duplicates\\ (…) | the only copies left are in `duplicates\`: they go when the quarantine is finalized, so keep `duplicates\` until this is resolved |
+    | **INCOMPLETE:** no copy found, but N path(s) couldn't be checked | permissions, timeouts or an unreachable share: see the paths file |
+    | **ALERT:** no copy found on tape or on the storage | the content is gone: look into it |
+
+- **`archive_missing_disk_paths.csv`:** one row per path checked: its role,
+  `state` (`exists`, `missing` or `error` with `detail`), size, date, and with
+  `--hash`, `md5_found` and `same_content`.
+
+**Back in R:** set `disk_result` to the folder with the two CSVs (copy
+both, keeping their names, if they were written on another machine) and
+run section 3 of
+`archive_missing_check.R`. Its chart and its second interactive table
+(`archive_missing_disk.html`) put the storage results next to the verdicts
+from the records. The first table (`archive_missing_check.html`, records only)
+stays as it was.
 
 `<plan>_execute_results.csv` is looked for in the plan's folder, which is
 where execute writes it unless you gave it another `--output`.
