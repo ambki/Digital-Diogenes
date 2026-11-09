@@ -646,23 +646,83 @@ def parse_size(text: str) -> int:
     return int(float(match.group(1)) * _SIZE_UNITS[unit])
 
 
+def exclude_folder(pattern: str) -> str | None:
+    """
+    The folder an --exclude pattern names, if it's a plain path: no * or ?,
+    starting with a drive (R:\\...) or \\\\server\\share (or / elsewhere), with
+    or without a trailing separator. None for wildcard patterns and bare
+    names ('thumbs.db'). Brackets count as part of the name here.
+    """
+    if "*" in pattern or "?" in pattern:
+        return None
+    cleaned = pattern.strip()
+    if re.fullmatch(r"[A-Za-z]:[\\/]*", cleaned):
+        return os.path.abspath(cleaned[:2] + os.sep)
+    if not (re.match(r"[A-Za-z]:[\\/]", cleaned) or cleaned.startswith(("\\\\", "//")) or os.path.isabs(cleaned)):
+        return None
+    return os.path.abspath(cleaned.rstrip("\\/"))
+
+
+def check_exclude_patterns(patterns: list[str] | None, root_abs: str) -> None:
+    """Stop before planning if an --exclude pattern can't be what was meant."""
+    for pattern in patterns or []:
+        if '"' in pattern:
+            raise SystemExit(
+                f"ERROR: --exclude {pattern!r} contains a quote. In PowerShell, a path ending in a "
+                'backslash followed by a quote ("R:\\folder\\") passes the quote on: write the folder '
+                'without the trailing backslash ("R:\\folder"), or in single quotes. No plan was written.'
+            )
+        folder = exclude_folder(pattern)
+        if folder is not None and relative_to_root(folder, root_abs) is None:
+            raise SystemExit(
+                f"ERROR: --exclude {pattern!r} is a folder that isn't under --root '{root_abs}'. "
+                "Write it as the listing does (same drive letter or \\\\server\\share spelling). "
+                "No plan was written."
+            )
+
+
 def build_exclude_matcher(patterns: list[str]) -> Callable[[str], str | None]:
     """
-    Return a function giving the first pattern a path matches (or None).
-    Patterns are case-insensitive wildcards matched against both the file
-    name ('thumbs.db', '*.ini') and the full path ('*\\.git\\*').
+    Return a function giving the first pattern a path matches (or None),
+    case-insensitively. A plain folder path (see exclude_folder) matches
+    everything in that folder and below; any other pattern is a wildcard
+    matched against both the file name ('thumbs.db', '*.ini') and the full
+    path ('*\\.git\\*', 'R:\\Old\\*').
     """
-    normalized = [os.path.normcase(p) for p in patterns]
+    rules = []
+    for original in patterns:
+        folder = exclude_folder(original)
+        if folder is not None:
+            rules.append((original, True, os.path.normcase(folder).rstrip("\\/") + os.sep))
+        else:
+            rules.append((original, False, os.path.normcase(original)))
 
     def _match(path: str) -> str | None:
         full = os.path.normcase(path)
         name = os.path.basename(full)
-        for original, pattern in zip(patterns, normalized):
-            if fnmatch.fnmatchcase(name, pattern) or fnmatch.fnmatchcase(full, pattern):
+        for original, is_folder, value in rules:
+            if is_folder:
+                if full.startswith(value):
+                    return original
+            elif fnmatch.fnmatchcase(name, value) or fnmatch.fnmatchcase(full, value):
                 return original
         return None
 
     return _match
+
+
+def report_excludes(patterns: list[str] | None, counts: Counter, unit: str, hint: str = "") -> None:
+    """Per --exclude pattern, how many files it excluded; a warning for those that excluded none."""
+    for pattern in patterns or []:
+        n = counts.get(pattern, 0)
+        kind = "folder" if exclude_folder(pattern) is not None else "pattern"
+        print(f"  --exclude {pattern!r} ({kind}): {n} {unit}")
+        if n == 0:
+            print(
+                f"  WARNING: --exclude {pattern!r} matched nothing.{hint} Check its spelling: a folder must be "
+                "written as in the listing (same drive letter or \\\\server\\share); a wildcard pattern must "
+                "match the whole path (e.g. '*\\Old Data\\*')."
+            )
 
 
 class PlanContext:
@@ -674,6 +734,7 @@ class PlanContext:
         # saves one check per file in pre-flight.
         self.duplicates_dir_exists = os.path.isdir(to_long_path(self.duplicates_dir))
         self.keepers = keepers
+        check_exclude_patterns(args.exclude, root_abs)
         self.matcher = build_exclude_matcher(DEFAULT_EXCLUDES + (args.exclude or []))
         self.min_size = args.min_size
         self.io_timeout = args.io_timeout
@@ -823,6 +884,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     groups = moves = long_paths = total_rows = 0
     move_bytes = 0
     skipped: Counter = Counter()
+    excluded: Counter = Counter()
     if args.no_preflight:
         print("Pre-flight checks skipped (--no-preflight); execute still checks every file before moving it.")
     elif not ctx.duplicates_dir_exists:
@@ -847,6 +909,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
             move_bytes += int(df.loc[is_move, "size"].sum())
             long_paths += int((is_move & df["long_path"]).sum())
             skipped.update(df.loc[df["action"] == "SKIP", "reason"])
+            excluded.update(df.loc[df["reason"] == "EXCLUDED_PATTERN", "detail"].str.removeprefix("pattern "))
             total_rows += len(df)
             progress.set_postfix(to_move=moves, refresh=False)
             del df
@@ -876,6 +939,10 @@ def cmd_plan(args: argparse.Namespace) -> None:
     )
     if skipped:
         print("Skipped: " + " | ".join(f"{reason} {count}" for reason, count in skipped.most_common()))
+    if args.exclude:
+        print("Excluded duplicates per --exclude:")
+        report_excludes(args.exclude, excluded, "duplicate(s) excluded",
+                        " Only duplicates that would move count here, so a folder without any is fine.")
     print(f"Plan written to: {plan_path}")
     print(f"Settings written to: {settings_path(plan_path)}")
     print(
@@ -1487,7 +1554,11 @@ def parse_args() -> argparse.Namespace:
     )
     plan.add_argument(
         "--exclude", nargs="+", metavar="PATTERN",
-        help=f"Extra wildcard patterns never to move, matched against file name or full path (always excluded: {', '.join(DEFAULT_EXCLUDES)}).",
+        help=(
+            "Extra patterns never to move: a folder path (R:\\Old - that folder and everything in it), "
+            "or a wildcard matched against file name or full path ('*\\Old\\*', '*.tmp'). "
+            f"Always excluded: {', '.join(DEFAULT_EXCLUDES)}."
+        ),
     )
     plan.add_argument(
         "--no-preflight", action="store_true",

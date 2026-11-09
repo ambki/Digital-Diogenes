@@ -48,6 +48,7 @@ try:
         _row_check,
         build_exclude_matcher,
         check_against_scan,
+        check_exclude_patterns,
         count_rows,
         execute_outcomes,
         execute_results_path,
@@ -58,6 +59,7 @@ try:
         path_hash,
         probe,
         relative_to_root,
+        report_excludes,
     )
     from quarantine_duplicates import NOTE_FILENAME as QUARANTINE_NOTE_FILENAME
 except ModuleNotFoundError as exc:
@@ -528,6 +530,7 @@ class Decisions:
         self.blocking = np.zeros(n, dtype=bool)
         self.follow = np.zeros(n, dtype=bool)
         self.git = [""] * n
+        self.pattern: list[str | None] = [None] * n  # the --exclude pattern a file matches, in or out of the range
 
     def set(self, i: int, action: str, reason: str, role: str, detail: str = "") -> None:
         self.action[i], self.reason[i], self.role[i], self.detail[i] = action, reason, role, detail
@@ -556,7 +559,7 @@ def decide(block: pd.DataFrame, ctx: PlanContext, partial_git: set[str] | None) 
             else:
                 d.follow[i] = True
             continue
-        pattern = ctx.matcher(original) if ctx.matcher else None
+        pattern = d.pattern[i] = ctx.matcher(original) if ctx.matcher else None
         if kind == "system":
             if not in_range[i]:
                 d.follow[i] = True
@@ -619,6 +622,8 @@ class PlanStats:
         self.out_of_range_bytes = 0
         self.ignored = Counter()
         self.skipped = Counter()
+        self.matched = Counter()    # per --exclude pattern: the files it matches (in or out of the range)
+        self.excluded = Counter()   # per --exclude pattern: those in the range, kept by it (EXCLUDED_PATTERN)
         self.by_year: Counter = Counter()
         self.by_year_bytes: Counter = Counter()
         self.by_category: Counter = Counter()
@@ -715,6 +720,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
             f"ERROR: '{archive_dir}' already exists and is not empty (an earlier batch?). "
             "Copy it to tape and delete it, or undo that plan, before planning a new batch."
         )
+    check_exclude_patterns(args.exclude, root_abs)  # before a possibly long scan
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -780,6 +786,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
             ThreadPoolExecutor(max_workers=args.workers) as executor:
         for block in ctx.blocks("Building plan" if args.no_preflight else "Building plan + pre-flight checks"):
             d = decide(block, ctx, partial_git)
+            stats.matched.update(p for p in d.pattern if p)
             rows_np = block["row"].to_numpy()
             for i, (area, kind, name) in enumerate(zip(block["area"], block["kind"], block["name"])):
                 if area:
@@ -830,6 +837,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
             is_move = (df["action"] == "MOVE").to_numpy()
             skipped = df[~is_move]
             stats.skipped.update(skipped["reason"])
+            stats.excluded.update(skipped.loc[skipped["reason"] == "EXCLUDED_PATTERN", "detail"].str.removeprefix("pattern "))
             preflight_missing += int((skipped["reason"] == "FILE_MISSING").sum())
             for reason, folder_key in zip(skipped["reason"], sub["folder_key"].to_numpy()[~is_move]):
                 if reason.startswith("FILE_"):
@@ -962,6 +970,12 @@ def print_plan_summary(args, stats: PlanStats, follow: int, keeper_notes: int, f
         print("Ignored (already in duplicates/ or move_to_archive/): " + " | ".join(f"{k} {v}" for k, v in stats.ignored.items()))
     if stats.skipped:
         print("Skipped: " + " | ".join(f"{reason} {count}" for reason, count in stats.skipped.most_common()))
+    if args.exclude:
+        print("Files per --exclude (matched in the listing, of which in the date range and so kept by it):")
+        for pattern in args.exclude:
+            report_excludes([pattern], stats.matched, "file(s) matched")
+            if stats.matched.get(pattern):
+                print(f"      in the date range, kept (EXCLUDED_PATTERN): {stats.excluded.get(pattern, 0)}")
     print(
         f"Folders removed from the storage once emptied: {folders} | "
         f"notes/system files following their folder: {follow} | quarantine notes to update: {keeper_notes}"
@@ -1897,7 +1911,10 @@ def parse_args() -> argparse.Namespace:
     )
     plan.add_argument(
         "--exclude", nargs="+", metavar="PATTERN",
-        help="Wildcard patterns never to move, matched case-insensitively against file name or full path.",
+        help=(
+            "Patterns never to move, case-insensitive: a folder path (R:\\Old - that folder and everything "
+            "in it), or a wildcard matched against file name or full path ('*\\Old\\*', '*.tmp')."
+        ),
     )
     plan.add_argument(
         "--no-preflight", action="store_true",
