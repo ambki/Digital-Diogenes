@@ -75,7 +75,8 @@ inputs <- c(
   results = paste0(prefix, "_execute_results.csv"),
   journal = paste0(prefix, "_journal.csv"),
   undo    = paste0(prefix, "_undo_journal.csv"),
-  verify  = paste0(prefix, "_verify_report.csv")
+  verify  = paste0(prefix, "_verify_report.csv"),
+  remaining = paste0(prefix, "_remaining_raw.csv")  # what stays on the storage (written by execute)
 )
 print(tibble(file = basename(inputs), found = file.exists(inputs)))
 
@@ -634,3 +635,182 @@ if (nrow(detail_rows) > 0) {
 } else {
   cat("Every row of the last execute run was moved, and verify found no problems.\n")
 }
+
+# ---- 8. Key numbers (overview table) ----------------------------------------------
+# One table with the headline numbers from every file above, plus the live
+# disk space of the volume(s) - read now, not at execute time, so it reflects
+# anything else that changed on the volume since.
+#   Plan            what the plan meant to move
+#   Last run        the last block of moves in the journal (a pause longer
+#                   than run_gap_minutes separates runs)
+#   Last execute    outcome per file from the results file (last execute run;
+#                   an execute that only retried will show just those files)
+#   All runs        net of restores: what sits in move_to_archive now
+#   Verify / Storage
+# Note: moving into move_to_archive on the SAME volume frees no space there -
+# space is freed only once the archive is copied off and removed. The
+# "Volume" rows say whether root and archive share a volume.
+
+# Plan totals per action, read in chunks (only two columns).
+get_plan <- function() cached("plan", function() {
+  cat(sprintf("Reading %s ...\n", basename(plan_path)))
+  read_csv_chunked(plan_path, DataFrameCallback$new(function(x, pos) {
+    x %>% group_by(action) %>%
+      summarise(files = n(), bytes = sum(suppressWarnings(as.numeric(size_bytes)), na.rm = TRUE), .groups = "drop")
+  }), chunk_size = chunk_rows, na = character(),
+  col_types = cols_only(action = col_character(), size_bytes = col_character())) %>%
+    group_by(action) %>% summarise(files = sum(files), bytes = sum(bytes), .groups = "drop")
+})
+
+# The plan's raw listing (the storage as scanned before the archive). Its path
+# comes from the plan's settings, as it was on the machine that made the
+# plan - set listing_path by hand if the file has moved since.
+listing_path <- settings$raw_csv   # e.g. r"(C:\path\to\duplicates_volume_b_raw.csv)"
+
+# Files and total size of a raw listing; NULL (with the reason printed) if it
+# can't be read - the rows using it are then left out of the table.
+listing_total <- function(path, what) cached(paste0("total_", what), function() {
+  if (is.null(path) || !file.exists(path)) {
+    cat(sprintf("%s not found - its rows are left out: %s\n", what, if (is.null(path)) "(no path)" else path))
+    return(NULL)
+  }
+  cat(sprintf("Reading %s (sizes only) ...\n", basename(path)))
+  if (!"size_gb" %in% names(read_csv(path, n_max = 0, show_col_types = FALSE))) {
+    cat(sprintf("%s has no size_gb column - its rows are left out: %s\n", what, path))
+    return(NULL)
+  }
+  read_csv_chunked(path, DataFrameCallback$new(function(x, pos) {
+    tibble(files = nrow(x), gb = sum(x$size_gb, na.rm = TRUE))
+  }), chunk_size = chunk_rows, col_types = cols_only(size_gb = col_double())) %>%
+    summarise(files = sum(files), gb = sum(gb))
+})
+
+# Live size and free space of the volume holding `path` (drive letter or UNC
+# share), via Windows' Scripting.FileSystemObject. AvailableSpace = what this
+# user can still write (quotas included). NA if it can't be read.
+volume_of <- function(path) {
+  if (grepl("^\\\\\\\\", path)) sub("^(\\\\\\\\[^\\\\]+\\\\[^\\\\]+).*$", "\\1", path) else toupper(substr(path, 1, 2))
+}
+disk_space <- function(path) {
+  cmd <- sprintf("$d=(New-Object -ComObject Scripting.FileSystemObject).GetDrive('%s'); $d.TotalSize; $d.AvailableSpace",
+                 volume_of(path))
+  out <- tryCatch(suppressWarnings(system2("powershell", c("-NoProfile", "-Command", shQuote(cmd, type = "cmd")),
+                                           stdout = TRUE, stderr = FALSE)),
+                  error = function(e) character())
+  v <- suppressWarnings(as.numeric(trimws(out)))
+  v <- v[!is.na(v)]
+  if (length(v) < 2) return(c(total_gb = NA, free_gb = NA))
+  c(total_gb = v[1] / 2^30, free_gb = v[2] / 2^30)
+}
+
+kn <- function(section, measure, files = NA_real_, gb = NA_real_, note = "") {
+  tibble(section = section, measure = measure, files = files, gb = gb, note = note)
+}
+key <- list()
+
+# Plan
+plan_totals <- get_plan()
+plan_move   <- plan_totals %>% filter(action == "MOVE")
+plan_other  <- plan_totals %>% filter(action != "MOVE")
+key$plan <- bind_rows(
+  kn("Plan", "Selected to move (MOVE)", sum(plan_move$files), sum(plan_move$bytes) / 2^30, label),
+  kn("Plan", "Not to move (other actions)", sum(plan_other$files), sum(plan_other$bytes) / 2^30,
+     paste(plan_other$action, collapse = ", "))
+)
+
+# Runs, from the journal (same run split as section 2, on unbinned seconds)
+journal_runs <- get_journal()$by_second %>%
+  mutate(time = as.POSIXct(second, format = "%Y-%m-%d %H:%M:%S", tz = "")) %>%
+  filter(!is.na(time)) %>% arrange(time) %>%
+  mutate(run = cumsum(c(TRUE, diff(as.numeric(time)) > run_gap_minutes * 60))) %>%
+  group_by(run) %>%
+  summarise(start = min(time), end = max(time), files = sum(files), gb = sum(bytes) / 2^30, .groups = "drop") %>%
+  mutate(hours = pmax(as.numeric(difftime(end, start, units = "hours")), 1 / 60))
+last_run <- slice_tail(journal_runs, n = 1)
+if (nrow(last_run) == 1) {
+  key$last_run <- bind_rows(
+    kn("Last run", "Moved (net of restores)", last_run$files, last_run$gb,
+       sprintf("%s to %s", format(last_run$start, "%Y-%m-%d %H:%M"), format(last_run$end, "%Y-%m-%d %H:%M"))),
+    kn("Last run", "Duration and speed", note = sprintf("%.1f h | %s files/h | %s/h", last_run$hours,
+       fmt_files(round(last_run$files / last_run$hours)), fmt_size(last_run$gb / last_run$hours)))
+  )
+}
+
+# Last execute run, from the results file (files, then folders)
+res <- get_results()
+res_files <- res %>% filter(kind %in% c("file", "system", "note"))
+key$execute <- res_files %>%
+  mutate(class = factor(class, levels = c("Moved", "Stayed: folder kept", "Skipped by a safety check", "Problem"))) %>%
+  group_by(class) %>%
+  summarise(files = n(), gb = sum(size_bytes, na.rm = TRUE) / 2^30, .groups = "drop") %>%
+  complete(class, fill = list(files = 0, gb = 0)) %>%
+  transmute(section = "Last execute", measure = paste0("Files: ", class), files, gb, note = "")
+folder_counts <- res %>% filter(kind == "folder") %>% count(class)
+key$execute <- bind_rows(key$execute, kn("Last execute", "Folders removed / kept / problem", note = sprintf("%s / %s / %s",
+  fmt_files(sum(folder_counts$n[folder_counts$class == "Folder removed"])),
+  fmt_files(sum(folder_counts$n[folder_counts$class == "Folder kept"])),
+  fmt_files(sum(folder_counts$n[folder_counts$class == "Problem"])))))
+
+# All runs: what is in move_to_archive now
+now_moved <- get_journal()$by_folder %>% summarise(files = sum(files), gb = sum(gb))
+key$all_runs <- bind_rows(
+  kn("All runs", "In move_to_archive now (net of restores)", now_moved$files, now_moved$gb,
+     sprintf("%d run(s)", nrow(journal_runs))),
+  kn("All runs", "Moved vs. selected in the plan", note = sprintf("%s of the files, %s of the space",
+     fmt_pct(now_moved$files / max(sum(plan_move$files), 1)), fmt_pct(now_moved$gb / max(sum(plan_move$bytes) / 2^30, 1e-9))))
+)
+
+# Verify
+if (file.exists(inputs[["verify"]])) {
+  v <- get_verify() %>% group_by(class) %>% summarise(files = n(), gb = sum(size_bytes, na.rm = TRUE) / 2^30, .groups = "drop")
+  key$verify <- bind_rows(
+    kn("Verify", "Verified OK", sum(v$files[v$class == "Verified OK"]), sum(v$gb[v$class == "Verified OK"])),
+    kn("Verify", "Problems", sum(v$files[v$class == "Problem"]), sum(v$gb[v$class == "Problem"]))
+  )
+}
+
+# Storage: size before the archive, and the volume(s) now
+# "Still in the storage" is data left in the scanned folder, not free disk
+# space: it ignores the volume's capacity, anything outside the scan, and -
+# with the archive on the same volume - the moved data still there. Taken
+# from execute's remaining listing when there is one (exact: it also leaves
+# out anything under move_to_archive); else estimated as scanned - moved.
+scanned   <- listing_total(listing_path, "Raw listing")
+# Path built here rather than read from `inputs`, so this works even if Setup
+# was last run before the remaining listing was added to it.
+remaining <- listing_total(paste0(prefix, "_remaining_raw.csv"), "Remaining listing")
+key$storage <- bind_rows(
+  if (!is.null(scanned))
+    kn("Storage", "Scanned before the archive (raw listing)", scanned$files, scanned$gb,
+       sprintf("archived now: %s of it", fmt_pct(now_moved$gb / max(scanned$gb, 1e-9)))),
+  if (!is.null(remaining))
+    kn("Storage", "Still in the storage (remaining listing)", remaining$files, remaining$gb,
+       "from execute's remaining listing - data left, not free disk space")
+  else if (!is.null(scanned))
+    kn("Storage", "Still in the storage (scanned - moved)", scanned$files - now_moved$files,
+       scanned$gb - now_moved$gb, "estimate - data left, not free disk space")
+)
+same_volume <- !is.null(settings$archive_dir) && tolower(volume_of(settings$archive_dir)) == tolower(volume_of(root))
+vol_root <- disk_space(root)
+key$volume <- kn("Volume", sprintf("Root volume %s: size / free now", volume_of(root)), gb = vol_root[["free_gb"]],
+                 note = sprintf("size %s, free %s (%s)%s", fmt_size(vol_root[["total_gb"]]), fmt_size(vol_root[["free_gb"]]),
+                                fmt_pct(vol_root[["free_gb"]] / vol_root[["total_gb"]]),
+                                if (same_volume) " | archive is on this same volume: moves free no space yet" else ""))
+if (!is.null(settings$archive_dir) && !same_volume) {
+  vol_arch <- disk_space(settings$archive_dir)
+  key$volume <- bind_rows(key$volume,
+    kn("Volume", sprintf("Archive volume %s: size / free now", volume_of(settings$archive_dir)), gb = vol_arch[["free_gb"]],
+       note = sprintf("size %s, free %s (%s)", fmt_size(vol_arch[["total_gb"]]), fmt_size(vol_arch[["free_gb"]]),
+                      fmt_pct(vol_arch[["free_gb"]] / vol_arch[["total_gb"]]))))
+}
+
+key_numbers <- bind_rows(key)
+print(key_numbers %>% mutate(files = ifelse(is.na(files), "", fmt_files(files)),
+                             size = ifelse(is.na(gb), "", fmt_size(gb))) %>%
+        select(section, measure, files, size, note), n = Inf)
+
+# ";" between columns and "," as decimal mark, so it opens in (European) Excel
+# straight into columns.
+dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
+write_excel_csv2(key_numbers, file.path(output_folder, "archive_execution_key_numbers.csv"))
+cat(sprintf("Saved: %s\n", file.path(output_folder, "archive_execution_key_numbers.csv")))
