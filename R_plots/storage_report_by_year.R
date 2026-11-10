@@ -62,6 +62,8 @@ output_percent_png     <- file.path(output_folder, "storage_by_year_percent.png"
 output_html            <- file.path(output_folder, "storage_by_year_interactive.html")
 output_top_wasted_png  <- file.path(output_folder, "top_wasted_directories.png")
 output_cumulative_png  <- file.path(output_folder, "cumulative_unique_growth.png")
+output_cumulative_root_png <- file.path(output_folder, "cumulative_growth_by_workstation.png")
+output_cumulative_root_csv <- file.path(output_folder, "cumulative_growth_by_workstation.csv")
 
 # ---- Load ---------------------------------------------------------------
 # Accepts either the current CSV outputs or an older .xlsx report from
@@ -553,6 +555,285 @@ p_cumulative <- ggplot(bar_data, aes(x = factor(year), y = segment_gb, fill = se
   )
 
 ggsave(output_cumulative_png, p_cumulative, width = 12, height = 7, dpi = 150)
+
+# ---- Cumulative storage growth per workstation (root folder) ---------------
+# Same chart as above, but one panel per root folder of the scanned volume -
+# each root folder is one workstation. Same numbers/convention as the overall
+# chart (non-duplicate data only, cumulative as of the start of each year), so
+# summing every panel's bar for a year gives the overall chart's bar for that
+# year (except for excluded_roots).
+#
+# The raw export holds absolute paths but not the scanned folder itself, so
+# `scan_root` is derived as the longest common folder of all paths. Set it by
+# hand if that guess is wrong - e.g. when every file sits under a single
+# workstation folder, the common folder would be that workstation itself.
+#
+# Split in three: "root folders" assigns each file its root folder, the
+# optional "merge other locations" subsection can then reassign some of them,
+# and "chart & numbers" only reads the resulting `files$root`.
+
+# ---- Per-workstation: root folders ------------------------------------------
+
+scan_root      <- NULL          # e.g. r"(\\server\share\Volume_B)"; NULL = derive automatically
+excluded_roots <- character(0)  # root folders to leave out entirely (case-insensitive), e.g. c("backup")
+
+norm_paths <- gsub("\\\\", "/", files$path)
+
+if (is.null(scan_root)) {
+  # The common prefix of the lexicographically smallest and largest path is
+  # the common prefix of ALL paths - no need to compare millions of strings.
+  ends <- range(norm_paths)
+  a <- strsplit(ends[1], "")[[1]]
+  b <- strsplit(ends[2], "")[[1]]
+  n <- min(length(a), length(b))
+  mismatch <- which(a[seq_len(n)] != b[seq_len(n)])
+  common <- substr(ends[1], 1, if (length(mismatch)) mismatch[1] - 1 else n)
+  # Cut back to the last whole folder ("/data/ws1" and "/data/ws2" share
+  # "/data/ws", but the root is "/data").
+  scan_root_norm <- sub("/[^/]*$", "", common)
+} else {
+  scan_root_norm <- sub("/+$", "", gsub("\\\\", "/", scan_root))
+}
+cat(sprintf("\nPer-workstation chart - root folders taken under: %s\n", scan_root_norm))
+
+# First folder of a path relative to some folder. Files sitting directly in
+# that folder (no subfolder below it) get "(top-level files)".
+first_segment <- function(rel) {
+  if_else(grepl("/", rel, fixed = TRUE), sub("/.*$", "", rel), "(top-level files)")
+}
+# Path relative to scan_root - kept on `files` so the merge subsection can
+# look one level deeper without redoing this.
+files$rel_path <- substr(norm_paths, nchar(scan_root_norm) + 2, nchar(norm_paths))
+files$root     <- first_segment(files$rel_path)
+rm(norm_paths)
+
+# ---- Per-workstation: merge other locations (optional) ----------------------
+# For a temporary layout where some workstations' data also sits under a
+# shared folder as merge_root/<folder>/... (e.g. backup/<workstation>/...):
+# files there are counted under the workstation mapped below, together with
+# that workstation's own root folder. Duplicates were checked over the whole
+# volume, so each content is still counted once (the keeper), wherever it is.
+#
+# Set merge_locations <- FALSE (or delete this subsection) to go back to the
+# plain root-folder view - merge_root is then just another root folder, which
+# excluded_roots above can leave out.
+
+merge_locations <- TRUE
+merge_root      <- "backup"     # root folder holding merge_root/<folder>/... (case-insensitive)
+
+# merge_root folders -> workstations. One row per pair; a workstation with
+# several folders gets several rows. Leave folder as NA where there's none.
+# Matching is case-insensitive. A folder not listed here still counts, as its
+# own panel "<merge_root>: <folder>", so nothing is silently dropped.
+#
+# To fill it: run this subsection once - it prints a ready-to-paste version of
+# this table with every workstation (root folder outside merge_root), plus the
+# folder names under merge_root to choose from.
+workstation_map <- tribble(
+  ~workstation, ~folder,
+  # "WS01",     "WS01_old",
+  NA,           NA
+)
+
+# Always starts again from rel_path, never from the current files$root (which
+# an earlier run of this subsection may already have rewritten) - so after
+# editing workstation_map, re-running just this subsection is enough.
+files$root <- first_segment(files$rel_path)
+
+if (merge_locations) {
+top_root    <- files$root
+in_merge    <- tolower(top_root) == tolower(merge_root)
+merge_name  <- if_else(in_merge, first_segment(sub("^[^/]*/", "", files$rel_path)), NA_character_)
+
+live_roots     <- sort(unique(top_root[!in_merge & !tolower(top_root) %in% tolower(excluded_roots)]))
+merge_folders  <- sort(unique(merge_name[in_merge]))
+
+# Validate the mapping: each folder may belong to one workstation only, and a
+# name that matches nothing is most likely a typo.
+map_used <- workstation_map %>%
+  filter(!is.na(folder), !is.na(workstation)) %>%
+  mutate(
+    key = tolower(trimws(folder)),
+    workstation = trimws(workstation),
+    # Use the root folder's own spelling when the name matches one ignoring
+    # case - "ws01" and "WS01" must end up as the same panel.
+    workstation = coalesce(live_roots[match(tolower(workstation), tolower(live_roots))], workstation)
+  )
+dup_keys <- map_used$folder[duplicated(map_used$key)]
+if (length(dup_keys)) {
+  stop("workstation_map lists these folders more than once: ", paste(unique(dup_keys), collapse = ", "))
+}
+unknown_folders <- setdiff(map_used$key, tolower(merge_folders))
+if (length(unknown_folders)) {
+  cat("\nworkstation_map - folder(s) not found under '", merge_root, "': ",
+      paste(unknown_folders, collapse = ", "), "\n", sep = "")
+}
+unknown_ws <- setdiff(map_used$workstation, live_roots)
+if (length(unknown_ws)) {
+  cat("workstation_map - workstation(s) not found outside '", merge_root, "' (each becomes its own panel): ",
+      paste(unknown_ws, collapse = ", "), "\n", sep = "")
+}
+
+mapped_ws <- map_used$workstation[match(tolower(merge_name), map_used$key)]
+files$root <- case_when(
+  !in_merge         ~ top_root,
+  !is.na(mapped_ws) ~ mapped_ws,
+  TRUE              ~ paste0(merge_root, ": ", merge_name)
+)
+
+# What the merge actually did, per folder - check here that every folder went
+# where you expected before trusting the chart.
+merge_summary <- tibble(folder = merge_name[in_merge], counted_as = files$root[in_merge],
+                        size_gb = files$size_gb[in_merge], keeper = !files$is_duplicate[in_merge]) %>%
+  group_by(folder, counted_as) %>%
+  # keeper_gb before size_gb: summarise() would otherwise see the summed scalar
+  summarise(files = n(), keeper_gb = sum(size_gb[keeper]), size_gb = sum(size_gb), .groups = "drop") %>%
+  arrange(counted_as, folder)
+cat(sprintf("\nMerge of '%s' folders into workstations (keeper_gb = what the chart counts):\n", merge_root))
+print(merge_summary, n = Inf)
+rm(top_root, in_merge, merge_name, mapped_ws)
+
+# Ready-to-paste table: every workstation, with the folder already mapped to
+# it (if any), else NA to fill in. Unmapped folders are listed below it.
+unmapped_folders <- setdiff(merge_folders, merge_folders[tolower(merge_folders) %in% map_used$key])
+template_rows <- unlist(lapply(live_roots, function(ws) {
+  mapped <- map_used$folder[map_used$workstation == ws]
+  if (length(mapped) == 0) mapped <- NA_character_
+  sprintf("  %-30s %s", paste0('"', ws, '",'), if_else(is.na(mapped), "NA", paste0('"', mapped, '"')))
+}))
+cat(
+  "\n---- workstation_map template (paste over the table in the script) ----\n",
+  "workstation_map <- tribble(\n  ~workstation, ~folder,\n",
+  paste(template_rows, collapse = ",\n"), "\n)\n",
+  sprintf("Unmapped folders under '%s' (%d): %s\n", merge_root, length(unmapped_folders),
+          if (length(unmapped_folders)) paste0('"', unmapped_folders, '"', collapse = ", ") else "none"),
+  sep = ""
+)
+}
+
+# ---- Per-workstation: chart & numbers ---------------------------------------
+# Only reads files$root, so it works the same with or without the merge.
+
+cumulative_root <- files %>%
+  # !is_duplicate keeps exactly one copy (the keeper) per content, wherever it
+  # lives, since duplicates were checked over the whole volume.
+  filter(!is_duplicate, !tolower(root) %in% tolower(excluded_roots), !is.na(year)) %>%
+  group_by(root, year) %>%
+  summarise(
+    unique_gb     = sum(size_gb[category == "Unique"]),
+    all_nondup_gb = sum(size_gb),
+    .groups = "drop"
+  ) %>%
+  # Every root gets every year, so a year with no new files still shows that
+  # workstation's (unchanged) running total instead of a gap.
+  complete(root, year = full_seq(year, 1), fill = list(unique_gb = 0, all_nondup_gb = 0)) %>%
+  group_by(root) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(
+    unique_cum        = cumsum(unique_gb),
+    all_nondup_cum    = cumsum(all_nondup_gb),
+    unique_start      = lag(unique_cum, default = 0),
+    all_nondup_start  = lag(all_nondup_cum, default = 0),
+    zip_unmixed_start = all_nondup_start - unique_start
+  ) %>%
+  ungroup() %>%
+  filter(year >= cumulative_start_year)
+
+# Numbers: one row per workstation and year, plus a console summary of where
+# each workstation stands at the start of the latest year shown.
+# write_excel_csv2: ";" between columns and "," as decimal mark, matching
+# Excel with a European locale - opens straight into columns, no
+# Text-to-Columns step that would split the decimals.
+write_excel_csv2(
+  cumulative_root %>%
+    select(root, year, unique_added_gb = unique_gb, all_nondup_added_gb = all_nondup_gb,
+           unique_start_gb = unique_start, zip_unmixed_start_gb = zip_unmixed_start,
+           total_start_gb = all_nondup_start),
+  output_cumulative_root_csv
+)
+cat(sprintf("Per-workstation cumulative numbers written to: %s\n", output_cumulative_root_csv))
+
+root_latest <- cumulative_root %>%
+  group_by(root) %>%
+  slice_max(year, n = 1) %>%
+  ungroup() %>%
+  arrange(desc(all_nondup_start)) %>%
+  mutate(share_pct = 100 * all_nondup_start / sum(all_nondup_start))
+
+cat(sprintf("\nCumulative non-duplicate size per workstation at the start of %d:\n", max(cumulative_root$year)))
+print(
+  root_latest %>%
+    select(root, unique_gb = unique_start, zip_unmixed_gb = zip_unmixed_start,
+           total_gb = all_nondup_start, share_pct),
+  n = Inf
+)
+
+# Ordered by size (largest workstation first panel) so the panels read as a
+# ranking; free y scales so small workstations stay readable.
+root_order <- root_latest$root
+
+root_bar_data <- cumulative_root %>%
+  select(root, year, Unique = unique_start, `Zip + Unmixed` = zip_unmixed_start) %>%
+  pivot_longer(c(Unique, `Zip + Unmixed`), names_to = "segment", values_to = "segment_gb") %>%
+  mutate(
+    segment = factor(segment, levels = c("Zip + Unmixed", "Unique")),
+    root    = factor(root, levels = root_order)
+  ) %>%
+  # Labels only where the segment is tall enough within its own panel.
+  group_by(root) %>%
+  mutate(label = if_else(segment_gb >= 0.12 * max(ave(segment_gb, year, FUN = sum)),
+                         label_comma(accuracy = 0.1, suffix = " GB")(segment_gb), "")) %>%
+  ungroup()
+
+root_line_data <- cumulative_root %>% mutate(root = factor(root, levels = root_order))
+
+n_roots <- length(root_order)
+root_ncol <- min(3, n_roots)
+
+p_cumulative_root <- ggplot(root_bar_data, aes(x = factor(year), y = segment_gb, fill = segment)) +
+  geom_col(width = 0.7, color = "#fcfcfb", linewidth = 0.3) +
+  geom_text(
+    aes(label = label, color = segment),
+    position = position_stack(vjust = 0.5), angle = 90, size = 2.3, fontface = "bold"
+  ) +
+  scale_color_manual(values = label_colors, guide = "none") +
+  geom_line(
+    data = root_line_data,
+    aes(x = factor(year), y = all_nondup_start, group = 1),
+    inherit.aes = FALSE, color = "#0b0b0b", linewidth = 0.7
+  ) +
+  geom_point(
+    data = root_line_data,
+    aes(x = factor(year), y = all_nondup_start),
+    inherit.aes = FALSE, color = "#0b0b0b", size = 1.1
+  ) +
+  facet_wrap(~root, ncol = root_ncol, scales = "free_y") +
+  scale_fill_manual(values = bar_palette, name = NULL) +
+  scale_y_continuous(labels = label_comma(suffix = " GB"), expand = expansion(mult = c(0, 0.08))) +
+  labs(
+    title = "Cumulative storage growth per workstation",
+    subtitle = paste0(
+      "One panel per workstation (root folder)",
+      # exists(): still works if the merge subsection was deleted altogether
+      if (exists("merge_locations") && isTRUE(merge_locations)) paste0(", its '", merge_root, "' folder(s) included") else "",
+      if (length(excluded_roots)) paste0(" (excluding: ", paste(excluded_roots, collapse = ", "), ")") else "",
+      " - unique vs. zip/unmixed as of the start of each year, line marks the combined total"
+    ),
+    x = NULL, y = "Cumulative size (start of year)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    plot.title   = element_text(face = "bold"),
+    strip.text   = element_text(face = "bold", hjust = 0),
+    legend.position = "top"
+  )
+
+print(p_cumulative_root)
+ggsave(output_cumulative_root_png, p_cumulative_root,
+       width = 14, height = 2 + 3.2 * ceiling(n_roots / root_ncol), dpi = 150, limitsize = FALSE)
 
 # ---- Cross-storage duplicates (from two existing raw exports) --------------
 # Same question as `duplicates_check.py --origin A --destination B --mode
