@@ -1,4 +1,4 @@
-# Quarantine plan profile: what `quarantine_duplicates.py plan` would move,
+# Quarantine plan profile: what `quarantine_duplicates_V2.py plan` would move,
 # in number of files and in storage space, and where it comes from.
 #
 # How to use: run section "0. Setup" once (it reads the plan - a few minutes
@@ -8,9 +8,9 @@
 # exports it into output_folder - run it, or skip it. In RStudio, put the
 # cursor in a section and press Ctrl+Alt+T (Run current section).
 #
-# Input: a move_plan_<timestamp>.csv written by `quarantine_duplicates.py
+# Input: a move_plan_<timestamp>.csv written by `quarantine_duplicates_V2.py
 # plan`, with its move_plan_<timestamp>_settings.json next to it (for the
-# volume root). Section 1 also uses duplicates_check.py's "<stem>_raw.csv"
+# volume root). Section 1 also uses duplicates_check_V2.py's "<stem>_raw.csv"
 # of the same scan, to put the plan in proportion to the whole volume.
 #
 # Memory: a plan for a large volume is several GB (Volume B: ~4 GB, ~6M rows), so it
@@ -33,7 +33,7 @@ library(jsonlite)
 
 # Configuration. Same pattern as storage_report_by_year.R: the block for the
 # volume you want goes last (later assignments win).
-# raw_path: duplicates_check.py's raw listing of the same scan (section 1).
+# raw_path: duplicates_check_V2.py's raw listing of the same scan (section 1).
 # NA = skip the whole-volume comparison.
 
 ##Volume A

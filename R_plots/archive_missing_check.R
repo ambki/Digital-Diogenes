@@ -1,7 +1,7 @@
 # Missing-files check: the files an archive plan selected but couldn't find
 # (FILE_MISSING), or that execute then found gone (MISSING,
 # SKIPPED_FILE_MISSING) - are they really gone duplicates (moved to
-# <root>\duplicates by quarantine_duplicates.py, with their keeper on tape or
+# <root>\duplicates by quarantine_duplicates_V2.py, with their keeper on tape or
 # still on the storage), or did something else remove them?
 #
 # Why they happen: an archive plan only knows its listing. When a listing
@@ -36,7 +36,7 @@
 #   OPTIONAL  quarantine journal(s)  move_plan_<date>_<time>_journal.csv (+ its
 #                                    _undo_journal.csv, found automatically): which files
 #                                    the quarantine moved, to where, and their keeper
-#   OPTIONAL  duplicates raw         the duplicates_check.py _raw.csv the quarantine was
+#   OPTIONAL  duplicates raw         the duplicates_check_V2.py _raw.csv the quarantine was
 #                                    planned from, to tell whether a file was the keeper
 #                                    (oldest copy) back then
 #   OPTIONAL  plan listing(s)        listing_path, or (default) the raw_csv in each plan's
@@ -80,7 +80,7 @@ library(htmlwidgets)
 #                  is found automatically). Strongly recommended if there was a
 #                  quarantine: without it, no file counts as quarantined, so
 #                  gone duplicates show as CHECK instead of OK.
-#   duplicates_raw The duplicates_check.py _raw.csv the quarantine was planned
+#   duplicates_raw The duplicates_check_V2.py _raw.csv the quarantine was planned
 #                  from. Without it, the "Keeper in the duplicates run" column
 #                  stays empty and the "was the duplicates run's keeper"
 #                  verdict can't appear.

@@ -15,67 +15,71 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-# This script reuses the scanning helpers of duplicates_check.py and the
-# move/journal helpers of quarantine_duplicates.py. Neither has to be run
-# first, but both files must sit in the same folder as this one.
+# The shared helpers (scanning, journal, CSV streaming, file checks) live in
+# diogenes_common.py, which must sit in the same folder as this script. No
+# other script is needed, nor has to be run first.
 try:
-    from duplicates_check import (
+    from diogenes_common import (
+        CHUNK_ROWS,
         DEFAULT_IO_TIMEOUT_SECONDS,
-        _bounded_map,
-        _list_directory_with_timeout,
-        _run_with_timeout,
-        build_raw_file_export,
-        build_skipped_folders_sheet,
-        calculate_md5,
-        scan_folder_md5,
-        to_long_path,
-        write_csv,
-    )
-    from quarantine_duplicates import (
         DUPLICATES_FOLDER_NAME,
         MAX_PATH_CHARS,
         MTIME_TOLERANCE_SECONDS,
+        QUARANTINE_NOTE_FILENAME,
         RAW_COLUMNS,
         CsvAppender,
         KeySet,
+        _bounded_map,
         _fmt_mtime,
         _is_under,
         _key,
+        _list_directory_with_timeout,
         _note_lock,
         _now,
         _print_counts,
         _read_note,
         _row_check,
+        _run_with_timeout,
         build_exclude_matcher,
+        build_raw_file_export,
+        build_skipped_folders_sheet,
+        calculate_md5,
         check_against_scan,
         check_exclude_patterns,
+        check_output_folder,
         count_rows,
         execute_outcomes,
         execute_results_path,
         hash_array,
         iter_csv,
+        iter_plan,
+        journal_path,
+        load_settings,
         matches_scan,
         output_prefix,
         path_hash,
         probe,
         relative_to_root,
         report_excludes,
+        scan_folder_md5,
+        settings_path,
+        to_long_path,
+        undo_journal_path,
+        write_csv,
     )
-    from quarantine_duplicates import NOTE_FILENAME as QUARANTINE_NOTE_FILENAME
 except ModuleNotFoundError as exc:
-    if exc.name not in ("duplicates_check", "quarantine_duplicates"):
+    if exc.name != "diogenes_common":
         raise
     raise SystemExit(
-        f"ERROR: {exc.name}.py was not found. archive_old_files.py uses its helpers, so "
-        "duplicates_check.py and quarantine_duplicates.py must be in the same folder as "
-        f"this script ({Path(__file__).resolve().parent})."
+        "ERROR: diogenes_common.py was not found. archive_old_files_V2.py uses its helpers, so it "
+        f"must be in the same folder as this script ({Path(__file__).resolve().parent})."
     ) from exc
 
 
 ARCHIVE_FOLDER_NAME = "move_to_archive"
 NOTE_FILENAME = "archived_files_location.txt"
 NOTE_HEADER = (
-    "# Files moved from active storage to the tape archive by archive_old_files.py. "
+    "# Files moved from active storage to the tape archive by archive_old_files_V2.py. "
     "Each line: one file (or removed folder), where it was, and where it went "
     f"(archive label + path inside {ARCHIVE_FOLDER_NAME}).\n"
 )
@@ -91,16 +95,18 @@ CATEGORY_CODES = {name: code for code, name in enumerate(CATEGORY_NAMES) if name
 UNIQUE, KEEPER, DUPLICATE, UNREADABLE = 1, 2, 3, 4
 CATEGORY_CHOICES = ["all", "unique", "keeper", "duplicate", "unreadable"]
 
-CHUNK_ROWS = 20_000
 PREFLIGHT_BATCH = 5_000
+SCRIPT_NAME = "archive_old_files"  # recorded in the plan settings, checked by load_settings
 PLAN_FORMAT = 1
+# Why --output may not be inside the archive folder.
+OUTPUT_INSIDE_WHY = "reports there would go to tape and show up in their own verification."
 
 PLAN_COLUMNS = [
     "action", "reason", "detail", "kind", "role", "category", "copies", "md5",
     "size_bytes", "size_gb", "mtime", "modified", "original_path", "archive_path",
     "extra", "long_path", "check",
 ]
-# As in quarantine_duplicates.py: everything but action/reason/detail is
+# As in quarantine_duplicates_V2.py: everything but action/reason/detail is
 # fingerprinted, since switching action between MOVE and SKIP is the only
 # supported edit of a plan.
 CHECKED_COLUMNS = [
@@ -210,51 +216,14 @@ def _dir_has_entries(path: str) -> bool:
         return False
 
 
-def journal_path(prefix: Path) -> Path:
-    return Path(f"{prefix}_journal.csv")
-
-
-def undo_journal_path(prefix: Path) -> Path:
-    return Path(f"{prefix}_undo_journal.csv")
-
-
 def remaining_path(prefix: Path) -> Path:
     return Path(f"{prefix}_remaining_raw.csv")
-
-
-def settings_path(plan_path: Path) -> Path:
-    return plan_path.with_name(f"{plan_path.stem}_settings.json")
-
-
-def load_settings(plan_path: Path) -> dict:
-    if not plan_path.is_file():
-        raise SystemExit(f"ERROR: plan file does not exist: {plan_path}")
-    if not settings_path(plan_path).is_file():
-        raise SystemExit(
-            f"ERROR: the plan's settings file is missing: {settings_path(plan_path)} "
-            "(it is written next to the plan by the 'plan' step)."
-        )
-    settings = json.loads(settings_path(plan_path).read_text(encoding="utf-8"))
-    if settings.get("script") != "archive_old_files" or settings.get("plan_format") != PLAN_FORMAT:
-        raise SystemExit(
-            f"ERROR: '{plan_path}' is not a plan made by this version of archive_old_files.py. "
-            "Re-run 'plan' to make a new one."
-        )
-    return settings
-
-
-def check_output_folder(output: str | Path, archive_dir: str) -> None:
-    if _is_under(str(output), archive_dir):
-        raise SystemExit(
-            f"ERROR: --output '{output}' is inside '{archive_dir}'; reports there would "
-            "go to tape and show up in their own verification."
-        )
 
 
 # --------------------------------------------------------------------------
 # Notes (archived_files_location.txt)
 # --------------------------------------------------------------------------
-# Same approach as quarantine_duplicates.py's notes: one appended note per
+# Same approach as quarantine_duplicates_V2.py's notes: one appended note per
 # folder, writes to a folder's note serialized by a lock from a fixed pool.
 # Every line this script writes ends in "| plan: <plan name>", which is how
 # undo finds and removes exactly its own lines, also from quarantine notes.
@@ -330,7 +299,7 @@ def iter_journal(path: Path) -> Iterator[pd.DataFrame]:
         return
     for chunk in iter_csv(path):
         if any(c not in chunk.columns for c in JOURNAL_COLUMNS):
-            raise SystemExit(f"ERROR: '{path}' is not a journal written by archive_old_files.py.")
+            raise SystemExit(f"ERROR: '{path}' is not a journal written by archive_old_files_V2.py.")
         yield chunk[chunk["original_path"] != ""]
 
 
@@ -469,7 +438,7 @@ def compute_categories(ctx: PlanContext) -> None:
     """
     Fill ctx.category/ctx.copies per listing row from the listing's own md5s:
     unique (md5 once), keeper (oldest copy; ties go to the first path
-    alphabetically, as in duplicates_check.py), duplicate (the other copies),
+    alphabetically, as in duplicates_check_V2.py), duplicate (the other copies),
     unreadable (no md5). Only data files outside duplicates/ and
     move_to_archive/ take part. md5s are kept as 8-byte prefixes, so 6
     million files need about 150 MB here.
@@ -677,7 +646,7 @@ def run_preflight(df: pd.DataFrame, ctx: PlanContext, executor: ThreadPoolExecut
 
 
 def scan_root(args: argparse.Namespace, root_abs: str, output: Path, stamp: str) -> Path:
-    """Scan and hash --root (as duplicates_check.py --folder does) into a raw listing."""
+    """Scan and hash --root (as duplicates_check_V2.py --folder does) into a raw listing."""
     listing = output / f"archive_scan_{stamp}_raw.csv"
     excluded = [
         Path(p).resolve() for p in (
@@ -714,7 +683,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     if not os.path.isdir(to_long_path(root_abs)):
         raise SystemExit(f"ERROR: --root does not exist or is not a folder: {root_abs}")
     archive_dir = os.path.join(root_abs, ARCHIVE_FOLDER_NAME)
-    check_output_folder(args.output, archive_dir)
+    check_output_folder(args.output, archive_dir, OUTPUT_INSIDE_WHY)
     if _dir_has_entries(archive_dir):
         raise SystemExit(
             f"ERROR: '{archive_dir}' already exists and is not empty (an earlier batch?). "
@@ -916,7 +885,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     partial_path.replace(plan_path)
 
     settings = {
-        "script": "archive_old_files",
+        "script": SCRIPT_NAME,
         "plan_format": PLAN_FORMAT,
         "created_at": _now(),
         "root": root_abs,
@@ -947,7 +916,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     print(f"Settings written to: {settings_path(plan_path)}")
     print(
         "\nReview the plan (you may change 'action' between MOVE and SKIP), then run:\n"
-        f'  python archive_old_files.py execute --plan "{plan_path}"'
+        f'  python archive_old_files_V2.py execute --plan "{plan_path}"'
     )
 
 
@@ -1004,22 +973,13 @@ def print_plan_summary(args, stats: PlanStats, follow: int, keeper_notes: int, f
 # Plan validation (execute)
 # --------------------------------------------------------------------------
 
-def iter_plan(plan_path: Path) -> Iterator[pd.DataFrame]:
-    for chunk in iter_csv(plan_path):
-        missing = [c for c in PLAN_COLUMNS if c not in chunk.columns]
-        if missing:
-            raise SystemExit(f"ERROR: plan '{plan_path}' is missing column(s): {missing}")
-        chunk["action"] = chunk["action"].str.strip().str.upper()
-        yield chunk
-
-
 def validate_plan(plan_path: Path) -> Counter:
     """Check a (possibly hand-edited) plan; return the number of MOVE rows per kind and per "role:<role>"."""
     errors: list[str] = []
     seen: list[np.ndarray] = []
     moves: Counter = Counter()
     with tqdm(total=count_rows(plan_path), desc="Validating plan", unit="row") as progress:
-        for chunk in iter_plan(plan_path):
+        for chunk in iter_plan(plan_path, PLAN_COLUMNS):
             for row in chunk.itertuples(index=False):
                 if row.action not in ("MOVE", "SKIP"):
                     errors.append(f"unknown action '{row.action}' (allowed: MOVE, SKIP): {row.original_path}")
@@ -1157,7 +1117,7 @@ class Run:
         error = self.makedirs(os.path.dirname(row.archive_path))
         if error:
             return self.record_row(row, "MOVE_FAILED", error)
-        # os.rename, as in quarantine_duplicates.py: metadata-only on one
+        # os.rename, as in quarantine_duplicates_V2.py: metadata-only on one
         # volume, never overwrites, never falls back to copy+delete.
         _, error = _run_with_timeout(
             lambda: os.rename(to_long_path(row.original_path), to_long_path(row.archive_path)),
@@ -1167,7 +1127,7 @@ class Run:
             return self.record_row(row, "MOVE_TIMEOUT", f"{error}; re-run execute to find out whether it completed")
         if error is not None:
             return self.record_row(row, "MOVE_FAILED", f"{type(error).__name__}: {error}")
-        # rename -> notes -> journal, as in quarantine_duplicates.py.
+        # rename -> notes -> journal, as in quarantine_duplicates_V2.py.
         note_error = self.write_file_notes(row, check_existing=False)
         _journal("MOVED")
         self.moved.add(path_hash(row.original_path))
@@ -1295,7 +1255,7 @@ class Run:
 
 def _plan_rows(plan_path: Path, keep) -> Iterator[list]:
     """Blocks of plan rows (as namedtuples) for which keep(chunk) is True."""
-    for chunk in iter_plan(plan_path):
+    for chunk in iter_plan(plan_path, PLAN_COLUMNS):
         chunk = chunk[keep(chunk)]
         if len(chunk):
             yield list(chunk.itertuples(index=False))
@@ -1303,9 +1263,9 @@ def _plan_rows(plan_path: Path, keep) -> Iterator[list]:
 
 def cmd_execute(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT)
     prefix = output_prefix(plan_path, args.output)
-    check_output_folder(prefix.parent, settings["archive_dir"])
+    check_output_folder(prefix.parent, settings["archive_dir"], OUTPUT_INSIDE_WHY)
     archive_dir = settings["archive_dir"]
 
     moves = validate_plan(plan_path)
@@ -1487,7 +1447,7 @@ def run_verify(plan_path: Path, settings: dict, prefix: Path, args: argparse.Nam
     """
     Re-hash everything under <root>\\move_to_archive and compare it, by
     expected path and md5, with the moves recorded in the journal (as
-    quarantine_duplicates.py's verify does). Notes are only checked for
+    quarantine_duplicates_V2.py's verify does). Notes are only checked for
     presence: their content grows by design. The manifest and the
     archive-side notes written by this script are not reported.
     """
@@ -1546,7 +1506,7 @@ def run_verify(plan_path: Path, settings: dict, prefix: Path, args: argparse.Nam
             counts[status] += 1
 
         with tqdm(total=count_rows(plan_path), desc="Comparing with the plan", unit="row") as progress:
-            for chunk in iter_plan(plan_path):
+            for chunk in iter_plan(plan_path, PLAN_COLUMNS):
                 for row in chunk.itertuples(index=False):
                     if row.kind == "keeper_note":
                         continue
@@ -1658,9 +1618,9 @@ def run_verify_retried(plan_path: Path, settings: dict, prefix: Path, retry_keys
 
 def cmd_verify(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT)
     prefix = output_prefix(plan_path, args.output)
-    check_output_folder(prefix.parent, settings["archive_dir"])
+    check_output_folder(prefix.parent, settings["archive_dir"], OUTPUT_INSIDE_WHY)
     run_verify(plan_path, settings, prefix, args)
 
 
@@ -1688,7 +1648,7 @@ def write_remaining(plan_path: Path, settings: dict, prefix: Path, args: argpars
     The raw listing of what stays on the storage, without rescanning: the
     plan's input listing, minus every file currently moved out, minus
     anything under move_to_archive, with the notes this run wrote or changed
-    (and the root index) re-hashed fresh. Same columns as duplicates_check.py's
+    (and the root index) re-hashed fresh. Same columns as duplicates_check_V2.py's
     raw listing, so it is the input for the next plan (archive or quarantine)
     and for the R reports.
     """
@@ -1751,7 +1711,7 @@ def cmd_undo(args: argparse.Namespace) -> None:
     it can be re-run after an interruption.
     """
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT)
     prefix = output_prefix(plan_path, args.output)
     archive_dir = settings["archive_dir"]
     timeout = args.io_timeout
@@ -1893,8 +1853,8 @@ def parse_args() -> argparse.Namespace:
     plan.add_argument("--output", required=True, help="Folder to write the plan and, later, all reports into.")
     plan.add_argument(
         "--raw-csv",
-        help="The newest raw listing of --root (duplicates_check.py's <stem>_raw.csv, or a _remaining_raw.csv "
-             "of quarantine_duplicates.py or of this script). Default: scan and hash --root first.",
+        help="The newest raw listing of --root (duplicates_check_V2.py's <stem>_raw.csv, or a _remaining_raw.csv "
+             "of quarantine_duplicates_V2.py or of this script). Default: scan and hash --root first.",
     )
     dates = plan.add_argument_group("date range (on each file's modification time, UTC)")
     dates.add_argument("--before", metavar="DATE", help="Select files modified before DATE (e.g. 2016-01-01).")

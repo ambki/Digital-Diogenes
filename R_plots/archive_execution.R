@@ -1,4 +1,4 @@
-# Archive execution report: what `archive_old_files.py execute` (and verify /
+# Archive execution report: what `archive_old_files_V2.py execute` (and verify /
 # undo) actually did, from the files they write next to the plan:
 #   <plan>_execute_results.csv  outcome per file, folder and quarantine note (last execute run only)
 #   <plan>_journal.csv          every completed move and removed folder, all runs (timestamped)

@@ -18,7 +18,7 @@ RECENT = (datetime.now() - timedelta(days=30)).timestamp()
 
 QUARANTINE_NOTE = "original_file_location.txt"
 QUARANTINE_HEADER = (
-    "# Duplicate files moved out of this folder by quarantine_duplicates.py. "
+    "# Duplicate files moved out of this folder by quarantine_duplicates_V2.py. "
     "Each line: the moved file, where it is now, and the identical copy that was kept.\n"
 )
 
@@ -85,7 +85,7 @@ def add_fixtures(files: dict[str, tuple[bytes, float]], root: Path, index: int, 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Create a storage folder with known old/recent files, duplicates, quarantine notes "
-                    "and .git folders, for testing archive_old_files.py."
+                    "and .git folders, for testing archive_old_files_V2.py."
     )
     parser.add_argument("--path", required=True, help="Base folder where the test folder will be created.")
     parser.add_argument(
@@ -129,10 +129,10 @@ def main() -> None:
     reports = base / "archive_test" / "reports"
     print(f"\nCreated archive scenario at: {root}  ({len(files)} files)")
     print(
-        "  Plan (scans first):  python archive_old_files.py plan "
+        "  Plan (scans first):  python archive_old_files_V2.py plan "
         f'--root "{root}" --output "{reports}" --before {CUTOFF} --categories all --archive-label TEST-0001'
     )
-    print("  Then:               python archive_old_files.py execute --plan <the archive_plan_*.csv it wrote>")
+    print("  Then:               python archive_old_files_V2.py execute --plan <the archive_plan_*.csv it wrote>")
     print(
         "\nExpected with --categories all: old_project_N and old_sub removed; mixed_project_N keeps its recent "
         "file and gets a note; dup_groups_N A and B moved, C stays; quarantined_N's note moves and gets a "

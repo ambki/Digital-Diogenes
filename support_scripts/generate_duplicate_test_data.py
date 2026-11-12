@@ -29,7 +29,7 @@ def _write_file(path: Path, content: bytes) -> None:
 
 
 def build_folder_test_files(large_file_mb: int, num_files: int) -> dict[str, bytes]:
-    """Fixtures for `duplicates_check.py --folder ...`.
+    """Fixtures for `duplicates_check_V2.py --folder ...`.
 
     num_files repeats the whole fixture set (2 unique + 3-file duplicate
     group + large duplicate pair = 7 files per repetition) under a unique
@@ -130,7 +130,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a folder structure with known duplicates, mismatches, "
-            "and missing files, for testing duplicates_check.py."
+            "and missing files, for testing duplicates_check_V2.py."
         )
     )
     parser.add_argument(
@@ -143,7 +143,7 @@ def parse_args() -> argparse.Namespace:
         choices=["all", "folder", "between", "integrity"],
         default="all",
         help=(
-            "Which duplicates_check.py check to build a scenario for "
+            "Which duplicates_check_V2.py check to build a scenario for "
             "(default: all, builds every scenario at once)."
         ),
     )
@@ -206,7 +206,7 @@ def main() -> None:
 
         print(f"\nCreated folder-mode scenario at: {folder_test_root}")
         print(
-            "  Run: python duplicates_check.py "
+            "  Run: python duplicates_check_V2.py "
             f'--folder "{folder_test_root}" --threading --workers 8'
         )
 
@@ -242,7 +242,7 @@ def main() -> None:
         print(f"  Origin:      {origin_root}  ({len(origin_files)} files)")
         print(f"  Destination: {destination_root}  ({len(destination_files)} files)")
         print(
-            "  Run: python duplicates_check.py "
+            "  Run: python duplicates_check_V2.py "
             f'--origin "{origin_root}" --destination "{destination_root}" '
             f"--mode {args.mode} --threading --workers 8"
         )

@@ -1,4 +1,4 @@
-# Archive plan profile: what `archive_old_files.py plan` would move to
+# Archive plan profile: what `archive_old_files_V2.py plan` would move to
 # move_to_archive, in number of files and in storage space: per year, per
 # category, per folder, and what stays and why.
 #
@@ -11,7 +11,7 @@
 # In RStudio, put the cursor in a section and press Ctrl+Alt+T (Run current
 # section).
 #
-# Input: an archive_plan_<timestamp>.csv written by `archive_old_files.py
+# Input: an archive_plan_<timestamp>.csv written by `archive_old_files_V2.py
 # plan`, with its archive_plan_<timestamp>_settings.json next to it (for the
 # root, the date range, the categories and the listing the plan was made
 # from). Sections 1 and 2 also read that listing (the raw_csv in the

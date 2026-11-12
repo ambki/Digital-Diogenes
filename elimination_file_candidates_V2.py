@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from tqdm import tqdm
 
-from duplicates_check import (
+from diogenes_common import (
     DEFAULT_IO_TIMEOUT_SECONDS,
     _normalize_filter_paths,
     build_skipped_folders_sheet,
@@ -43,7 +43,7 @@ def scan_folder_metadata(
     Recursively scan a folder and return (df, skipped_folders): a DataFrame
     with columns path, filename, size_bytes, mtime, modified; and a list of
     directories that couldn't be accessed (see walk_files_with_skip_report
-    in duplicates_check.py).
+    in diogenes_common.py).
 
     A locked/corrupted/unreachable folder or file is treated as unreadable
     (rather than aborting or hanging the scan) once it's unresponsive for
@@ -54,7 +54,7 @@ def scan_folder_metadata(
     `included`/`excluded` optionally restrict the scan to, or prune it away
     from, specific subfolders of `folder_path` (see walk_files_with_skip_report).
 
-    Unlike scan_folder_md5() in duplicates_check.py, this does not hash file
+    Unlike scan_folder_md5() in diogenes_common.py, this does not hash file
     contents, since only size/age/name/path metadata is needed here.
     """
     folder = Path(folder_path)
@@ -110,7 +110,7 @@ def scan_folder_metadata(
 def build_raw_export(scan: pd.DataFrame) -> pd.DataFrame:
     """
     Full filename/path/mtime/size_gb listing of every file scanned (not
-    just the old/zip/Unmixed groups) — same shape as duplicates_check.py's
+    just the old/zip/Unmixed groups) — same shape as duplicates_check_V2.py's
     raw export (minus md5, which this script never computes), so it can
     also be used as a --resume-from input there. The scan already walks
     every file regardless of which groups are requested, so this is free.

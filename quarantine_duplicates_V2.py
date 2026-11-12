@@ -2,18 +2,14 @@ from __future__ import annotations
 
 import argparse
 import csv
-import fnmatch
 import gc
-import hashlib
 import json
 import os
 import re
-import threading
-import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime
 from itertools import chain
 from pathlib import Path
 
@@ -21,42 +17,77 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from duplicates_check import (
+# The shared helpers live in diogenes_common.py, which must sit in the same
+# folder as this script.
+from diogenes_common import (
     DEFAULT_IO_TIMEOUT_SECONDS,
+    DUPLICATES_FOLDER_NAME,
+    MAX_PATH_CHARS,
+    MTIME_TOLERANCE_SECONDS,
+    RAW_COLUMNS,
+    RETRY_RESULTS_SUFFIX,
+    CsvAppender,
+    KeySet,
     _bounded_map,
+    _fmt_mtime,
+    _is_under,
+    _key,
+    _note_lock,
+    _now,
+    _print_counts,
+    _read_note,
+    _row_check,
     _run_with_timeout,
+    build_exclude_matcher,
     calculate_md5,
+    check_against_scan,
+    check_exclude_patterns,
+    check_output_folder,
+    count_rows,
+    execute_outcomes,
+    execute_results_path,
+    hash_array,
+    iter_csv,
+    iter_plan,
+    journal_path,
+    load_settings,
+    matches_scan,
+    output_prefix,
+    path_hash,
+    probe,
+    relative_to_root,
+    report_excludes,
     scan_folder_md5,
+    settings_path,
     to_long_path,
+    undo_journal_path,
 )
+from diogenes_common import QUARANTINE_NOTE_FILENAME as NOTE_FILENAME
 
 
-DUPLICATES_FOLDER_NAME = "duplicates"
-NOTE_FILENAME = "original_file_location.txt"
+# Recorded in the plan settings and checked by load_settings. Settings
+# without it (made before it was recorded) are taken as this script's own
+# (unnamed_is_mine=True); archive_old_files_V2.py has always recorded it.
+SCRIPT_NAME = "quarantine_duplicates"
+# Why --output may not be inside the duplicates folder.
+OUTPUT_INSIDE_WHY = "reports there would show up in their own verification as unexpected files."
 NOTE_HEADER = (
-    "# Duplicate files moved out of this folder by quarantine_duplicates.py. "
+    "# Duplicate files moved out of this folder by quarantine_duplicates_V2.py. "
     "Each line: the moved file, where it is now, and the identical copy that was kept.\n"
 )
-# Some file systems (FAT/exFAT, some NAS shares) only store mtime to 2s,
-# and a CSV round trip can round it, so an exact comparison would flag
-# unchanged files as changed.
-MTIME_TOLERANCE_SECONDS = 2.0
-# Windows MAX_PATH is 260 including the terminating NUL. Longer paths still
-# work here (see to_long_path) but are flagged, since other tools may not
-# handle them.
-MAX_PATH_CHARS = 259
 DEFAULT_EXCLUDES = ["desktop.ini", "thumbs.db", "*\\.git\\*", NOTE_FILENAME]
 
-# Memory: every command streams its CSVs in blocks of CHUNK_ROWS rows rather
-# than loading them whole. At ~6 million duplicates (a 1.7 GB duplicates
-# CSV), holding the list in memory even once is several GB of Python
-# strings, and each processing step used to add another copy - enough to
-# push an 8 GB machine into swap. Sets of millions of paths are kept as
-# 8-byte fingerprints in sorted numpy arrays (see path_hash/KeySet), not as
-# ~300-byte strings. Blocks are kept small so every progress bar moves at
-# least about once a second (bars advance per block); measured, smaller
-# blocks cost no extra time.
-CHUNK_ROWS = 20_000
+# Memory: every command streams its CSVs in blocks of CHUNK_ROWS rows (set
+# in diogenes_common.py) rather than loading them whole. At ~6 million
+# duplicates (a 1.7 GB duplicates CSV), holding the list in memory even
+# once is several GB of Python strings, and each processing step used to
+# add another copy - enough to push an 8 GB machine into swap. Sets of
+# millions of paths are kept as 8-byte fingerprints in sorted numpy arrays
+# (see path_hash/KeySet in diogenes_common.py), not as ~300-byte strings.
+# Blocks are kept small so every progress bar moves at least about once a
+# second (bars advance per block); measured, smaller blocks cost no extra
+# time.
+
 # Pre-flight checks are sent to the file server in batches this size, so
 # the progress bar moves steadily while a block is being checked.
 PREFLIGHT_BATCH = 5_000
@@ -82,7 +113,6 @@ JOURNAL_COLUMNS = [
 ]
 MOVED_STATUSES = {"MOVED", "MOVED_RESUMED"}
 RETRY_STATUSES = {"ERROR", "MOVE_FAILED", "MOVE_TIMEOUT"}  # what execute --retry-failed tries again
-RETRY_RESULTS_SUFFIX = "__movedFailed"
 EXECUTE_RESULT_COLUMNS = [
     "status", "detail", "md5", "size_bytes", "modified",
     "original_path", "duplicates_path", "keeper_path", "long_path",
@@ -92,233 +122,12 @@ VERIFY_COLUMNS = [
     "keeper_path", "size_bytes", "size_found", "mtime_original", "mtime_found", "long_path",
 ]
 UNDO_RESULT_COLUMNS = ["status", "detail", "md5", "size_bytes", "mtime", "original_path", "duplicates_path", "keeper_path"]
-RAW_COLUMNS = ["filename", "path", "mtime", "md5", "size_gb"]
 
 
-# --------------------------------------------------------------------------
-# Paths
-# --------------------------------------------------------------------------
 # Every filesystem call below goes through to_long_path (from
-# duplicates_check.py): moving a file into <root>\duplicates\ makes its path
+# diogenes_common.py): moving a file into <root>\duplicates\ makes its path
 # 11 characters longer, so a source path just under Windows' 260-character
 # limit can end up just over it. Reports always show normal paths.
-
-
-def _key(path: str) -> str:
-    """Comparison key for a path: case-insensitive, normalized separators."""
-    return os.path.normcase(os.path.abspath(path))
-
-
-def path_hash(path: str) -> int:
-    """
-    64-bit fingerprint of a path's comparison key. Sets of millions of paths
-    (moved files, files found in the duplicates folder) are kept as sorted
-    numpy arrays of these - 8 bytes per path instead of ~300 for the string.
-    The chance of two different paths sharing a fingerprint is about 1 in a
-    million even at 6 million paths.
-    """
-    digest = hashlib.blake2b(_key(path).encode("utf-8", "surrogatepass"), digest_size=8).digest()
-    return int.from_bytes(digest, "little")
-
-
-def hash_array(paths: Iterable[str], count: int, desc: str | None = None) -> np.ndarray:
-    """path_hash of every path, as a uint64 array (optionally with a progress bar)."""
-    if not desc:
-        return np.fromiter((path_hash(p) for p in paths), dtype=np.uint64, count=count)
-    with tqdm(total=count, desc=desc, unit="file") as progress:
-        result = np.empty(count, dtype=np.uint64)
-        for i, path in enumerate(paths):
-            result[i] = path_hash(path)
-            if i % 10_000 == 0:
-                progress.update(min(10_000, count - progress.n))
-        progress.update(count - progress.n)
-        return result
-
-
-class KeySet:
-    """
-    Set membership for path fingerprints: a sorted uint64 array (built once)
-    plus a small Python set for fingerprints added during the run.
-    """
-
-    def __init__(self, hashes: np.ndarray | None = None) -> None:
-        self._sorted = np.unique(hashes) if hashes is not None and len(hashes) else np.zeros(0, np.uint64)
-        self._added: set[int] = set()
-
-    def __contains__(self, value: int) -> bool:
-        if value in self._added:
-            return True
-        index = int(np.searchsorted(self._sorted, np.uint64(value)))
-        return index < len(self._sorted) and int(self._sorted[index]) == value
-
-    def add(self, value: int) -> None:
-        self._added.add(value)  # set.add is atomic under the GIL
-
-    def __len__(self) -> int:
-        return len(self._sorted) + len(self._added)
-
-
-def relative_to_root(path: str, root_abs: str) -> str | None:
-    """`path` relative to `root_abs`, or None if it isn't under it."""
-    prefix = root_abs.rstrip("\\/") + os.sep
-    if not os.path.normcase(path).startswith(os.path.normcase(prefix)):
-        return None
-    return path[len(prefix):]
-
-
-def _is_under(path: str, folder: str) -> bool:
-    key, folder_key = _key(path), _key(folder)
-    return key == folder_key or key.startswith(folder_key.rstrip("\\/") + os.sep)
-
-
-def _fmt_mtime(epoch: float) -> str:
-    # UTC, same as duplicates_check.py's exports (pd.to_datetime(unit="s")).
-    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _row_check(values: Iterable[str]) -> str:
-    """Fingerprint of a plan row's CHECKED_COLUMNS (as the strings in the CSV)."""
-    joined = "\x1f".join(values).encode("utf-8", "surrogatepass")
-    return hashlib.blake2b(joined, digest_size=8).hexdigest()
-
-
-# --------------------------------------------------------------------------
-# CSV streaming
-# --------------------------------------------------------------------------
-
-def count_rows(path: str | Path) -> int:
-    """Data rows in a CSV (newlines minus the header), for progress bar totals."""
-    count = 0
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(16 << 20), b""):
-            count += block.count(b"\n")
-    return max(count - 1, 0)
-
-
-def iter_csv(
-    path: str | Path, columns: list[str] | None = None, chunksize: int = CHUNK_ROWS
-) -> Iterator[pd.DataFrame]:
-    """
-    Read a CSV in blocks, every column as a string. keep_default_na=False: a
-    file literally named "NA" or "null" must stay a string, not become NaN.
-    Rows broken by a process being killed mid-write are skipped.
-    """
-    try:
-        reader = pd.read_csv(
-            path, usecols=columns, dtype=str, keep_default_na=False,
-            chunksize=chunksize, on_bad_lines="skip",
-        )
-    except ValueError as exc:
-        raise SystemExit(f"ERROR: '{path}' is missing expected column(s) {columns}: {exc}") from exc
-    yield from reader
-
-
-class CsvAppender:
-    """
-    Thread-safe CSV writer, one row at a time, flushed immediately so rows
-    survive the process being killed. With durable=True it is also fsync'd
-    at most every couple of seconds (fsync per row would serialize millions
-    of moves behind the disk); losing that last moment only matters for a
-    power cut, and resuming works from the files on disk anyway.
-    """
-
-    def __init__(self, path: Path, columns: list[str], append: bool, durable: bool = False) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        is_new = not append or not path.exists() or path.stat().st_size == 0
-        needs_newline = False
-        if not is_new:
-            # A kill can cut the last row short; start on a fresh line so
-            # the next row isn't glued onto it (the broken row is skipped
-            # when reading, see iter_csv).
-            with open(path, "rb") as handle:
-                handle.seek(-1, os.SEEK_END)
-                needs_newline = handle.read(1) != b"\n"
-        self._handle = open(path, "a" if not is_new else "w", newline="", encoding="utf-8")
-        if needs_newline:
-            self._handle.write("\r\n")
-        self._writer = csv.writer(self._handle)
-        if is_new:
-            self._writer.writerow(columns)
-        self._durable = durable
-        self._last_sync = 0.0
-        self._lock = threading.Lock()
-        self._sync(force=True)
-
-    def _sync(self, force: bool = False) -> None:
-        self._handle.flush()
-        if self._durable and (force or time.monotonic() - self._last_sync >= 2.0):
-            os.fsync(self._handle.fileno())
-            self._last_sync = time.monotonic()
-
-    def append(self, values: list) -> None:
-        with self._lock:
-            self._writer.writerow(values)
-            self._sync()
-
-    def close(self) -> None:
-        with self._lock:
-            self._sync(force=True)
-            self._handle.close()
-
-    def __enter__(self) -> "CsvAppender":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()
-
-
-# --------------------------------------------------------------------------
-# Filesystem probes (all with timeouts, see duplicates_check._run_with_timeout)
-# --------------------------------------------------------------------------
-
-Probe = tuple[str, int, float, str]  # (state, size, mtime, error)
-
-
-def probe(path: str, timeout: float) -> Probe:
-    """
-    stat() `path`: ("exists", size, mtime, ""), ("missing", 0, 0, ""), or
-    ("error", 0, 0, message) for permission denied, timeouts, etc.
-    "missing" and "error" are kept apart because only a genuinely missing
-    file means "already moved" when resuming. Only these three values are
-    kept (not the whole stat result), since pre-flight holds thousands.
-    """
-    value, error = _run_with_timeout(
-        lambda: os.stat(to_long_path(path)),
-        timeout,
-        f"Timed out after {timeout:.0f}s stat'ing '{path}'",
-    )
-    if error is None:
-        return "exists", value.st_size, value.st_mtime, ""  # type: ignore[union-attr]
-    if isinstance(error, FileNotFoundError):
-        return "missing", 0, 0.0, ""
-    return "error", 0, 0.0, f"{type(error).__name__}: {error}"
-
-
-def matches_scan(result: Probe, size: int, mtime: float) -> bool:
-    return result[1] == size and abs(result[2] - mtime) <= MTIME_TOLERANCE_SECONDS
-
-
-def check_against_scan(result: Probe, size: int, mtime: float, label: str) -> tuple[str, str] | None:
-    """
-    None if the probed file exists with the size/mtime recorded in the scan,
-    else (reason, detail), e.g. ("KEEPER_CHANGED", "size ... vs scan ...").
-    """
-    state, current_size, current_mtime, error = result
-    if state == "missing":
-        return f"{label}_MISSING", ""
-    if state == "error":
-        return f"{label}_UNREADABLE", error
-    if not matches_scan(result, size, mtime):
-        return (
-            f"{label}_CHANGED",
-            f"size {current_size} vs scan {size}; "
-            f"mtime {_fmt_mtime(current_mtime)} vs scan {_fmt_mtime(mtime)}",
-        )
-    return None
 
 
 # --------------------------------------------------------------------------
@@ -327,12 +136,6 @@ def check_against_scan(result: Probe, size: int, mtime: float, label: str) -> tu
 # One appended note per source folder. Moves run on several threads, so
 # writes to a folder's note are serialized by a lock picked from a fixed
 # pool by folder (two folders may share a lock; that only costs a wait).
-
-_NOTE_LOCKS = [threading.Lock() for _ in range(512)]
-
-
-def _note_lock(folder: str) -> threading.Lock:
-    return _NOTE_LOCKS[hash(_key(folder)) % len(_NOTE_LOCKS)]
 
 
 def _note_now_at(line: str) -> str | None:
@@ -345,14 +148,6 @@ def _note_now_at(line: str) -> str | None:
         if sep and key.strip() == "now_at":
             return _key(value)
     return None
-
-
-def _read_note(note_path: str) -> list[str]:
-    try:
-        with open(to_long_path(note_path), encoding="utf-8") as handle:
-            return handle.readlines()
-    except FileNotFoundError:
-        return []
 
 
 def note_add(row, timeout: float, check_existing: bool) -> str:
@@ -409,14 +204,6 @@ def note_remove(folder: str, duplicates_keys: set[str], timeout: float) -> str:
 # Journal state
 # --------------------------------------------------------------------------
 
-def journal_path(prefix: Path) -> Path:
-    return Path(f"{prefix}_journal.csv")
-
-
-def undo_journal_path(prefix: Path) -> Path:
-    return Path(f"{prefix}_undo_journal.csv")
-
-
 def iter_journal(path: Path, statuses: set[str]) -> Iterator[pd.DataFrame]:
     """Complete journal rows with one of `statuses`, in blocks."""
     if not path.exists():
@@ -455,7 +242,7 @@ def moved_now(prefix: Path) -> KeySet:
 
 
 # --------------------------------------------------------------------------
-# Inputs: duplicates_check.py's folder-mode CSVs
+# Inputs: duplicates_check_V2.py's folder-mode CSVs
 # --------------------------------------------------------------------------
 
 def load_keepers(summary_csv: str | Path) -> dict[str, str]:
@@ -471,7 +258,7 @@ def load_keepers(summary_csv: str | Path) -> dict[str, str]:
 def iter_groups(duplicates_csv: str | Path) -> Iterator[pd.DataFrame]:
     """
     Blocks of `<stem>_folder_duplicates.csv` that always contain whole md5
-    groups. duplicates_check.py writes that file sorted by md5, so a group's
+    groups. duplicates_check_V2.py writes that file sorted by md5, so a group's
     rows are contiguous; the rows of the last group in each block are held
     back and prepended to the next block. Stops with an error if the file
     turns out not to be grouped by md5.
@@ -484,7 +271,7 @@ def iter_groups(duplicates_csv: str | Path) -> Iterator[pd.DataFrame]:
         groups = md5s.unique()
         if (md5s != md5s.shift()).sum() != len(groups) or not finished.isdisjoint(groups):
             raise SystemExit(
-                f"ERROR: '{duplicates_csv}' is not grouped by md5 (duplicates_check.py writes it "
+                f"ERROR: '{duplicates_csv}' is not grouped by md5 (duplicates_check_V2.py writes it "
                 "sorted by md5; was it re-sorted or edited?)."
             )
         finished.update(groups)
@@ -506,36 +293,6 @@ def iter_groups(duplicates_csv: str | Path) -> Iterator[pd.DataFrame]:
 # Plan files
 # --------------------------------------------------------------------------
 
-def settings_path(plan_path: Path) -> Path:
-    return plan_path.with_name(f"{plan_path.stem}_settings.json")
-
-
-def load_settings(plan_path: Path) -> dict:
-    if not plan_path.is_file():
-        raise SystemExit(f"ERROR: plan file does not exist: {plan_path}")
-    if not settings_path(plan_path).is_file():
-        raise SystemExit(
-            f"ERROR: the plan's settings file is missing: {settings_path(plan_path)} "
-            "(it is written next to the plan by the 'plan' step)."
-        )
-    settings = json.loads(settings_path(plan_path).read_text(encoding="utf-8"))
-    if settings.get("plan_format") != PLAN_FORMAT:
-        raise SystemExit(
-            f"ERROR: '{plan_path}' was made by an earlier version of this script. "
-            "Re-run 'plan' to make a new one."
-        )
-    return settings
-
-
-def iter_plan(plan_path: Path) -> Iterator[pd.DataFrame]:
-    for chunk in iter_csv(plan_path):
-        missing = [c for c in PLAN_COLUMNS if c not in chunk.columns]
-        if missing:
-            raise SystemExit(f"ERROR: plan '{plan_path}' is missing column(s): {missing}")
-        chunk["action"] = chunk["action"].str.strip().str.upper()
-        yield chunk
-
-
 def validate_plan(plan_path: Path) -> int:
     """
     Check a (possibly hand-edited) plan before anything is moved, and return
@@ -549,7 +306,7 @@ def validate_plan(plan_path: Path) -> int:
     seen: list[np.ndarray] = []
     moves = 0
     with tqdm(total=count_rows(plan_path), desc="Validating plan", unit="row") as progress:
-        for chunk in iter_plan(plan_path):
+        for chunk in iter_plan(plan_path, PLAN_COLUMNS):
             for row in chunk.itertuples(index=False):
                 if row.action not in ("MOVE", "SKIP", "KEEP"):
                     errors.append(f"unknown action '{row.action}' (allowed: MOVE, SKIP, KEEP): {row.original_path}")
@@ -579,55 +336,6 @@ def validate_plan(plan_path: Path) -> int:
     return moves
 
 
-def output_prefix(plan_path: Path, output: str | None) -> Path:
-    """Base path for a plan's journal/report files: <output>/<plan stem>."""
-    folder = Path(output) if output else plan_path.parent
-    return folder / plan_path.stem
-
-
-def execute_results_path(prefix: Path, retry_failed: bool = False) -> Path:
-    """<prefix>_execute_results.csv, or its __movedFailed twin for --retry-failed runs."""
-    return Path(f"{prefix}_execute_results{RETRY_RESULTS_SUFFIX if retry_failed else ''}.csv")
-
-
-def execute_outcomes(prefix: Path, keep: Callable[[str], bool]) -> dict[int, tuple[str, str]]:
-    """
-    Latest execute outcome per file whose status passes `keep`, as path
-    fingerprint -> (status, detail). A full run's results cover every MOVE
-    row; a --retry-failed run's results cover only the rows it retried and
-    override the full run's, unless a full run was made after them.
-    """
-    full, retry = execute_results_path(prefix), execute_results_path(prefix, retry_failed=True)
-    if not full.exists():
-        return {}
-    outcomes: dict[int, tuple[str, str]] = {}
-    for chunk in iter_csv(full, ["status", "detail", "original_path"]):
-        chunk = chunk[chunk["status"].map(keep)]
-        for status, detail, path in zip(chunk["status"], chunk["detail"], chunk["original_path"]):
-            outcomes[path_hash(path)] = (status, detail)
-    if retry.exists() and retry.stat().st_mtime > full.stat().st_mtime:
-        for chunk in iter_csv(retry, ["status", "detail", "original_path"]):
-            for status, detail, path in zip(chunk["status"], chunk["detail"], chunk["original_path"]):
-                if keep(status):
-                    outcomes[path_hash(path)] = (status, detail)
-                else:
-                    outcomes.pop(path_hash(path), None)
-    return outcomes
-
-
-def check_output_folder(output: str | Path, duplicates_dir: str) -> None:
-    if _is_under(str(output), duplicates_dir):
-        raise SystemExit(
-            f"ERROR: --output '{output}' is inside '{duplicates_dir}'; reports there "
-            "would show up in their own verification as unexpected files."
-        )
-
-
-def _print_counts(title: str, counts: Counter, empty: str) -> None:
-    print(f"\n=== {title} ===")
-    print(" | ".join(f"{status} {count}" for status, count in counts.most_common()) or empty)
-
-
 # --------------------------------------------------------------------------
 # plan
 # --------------------------------------------------------------------------
@@ -644,85 +352,6 @@ def parse_size(text: str) -> int:
     if not unit.endswith("B"):
         unit += "B"
     return int(float(match.group(1)) * _SIZE_UNITS[unit])
-
-
-def exclude_folder(pattern: str) -> str | None:
-    """
-    The folder an --exclude pattern names, if it's a plain path: no * or ?,
-    starting with a drive (R:\\...) or \\\\server\\share (or / elsewhere), with
-    or without a trailing separator. None for wildcard patterns and bare
-    names ('thumbs.db'). Brackets count as part of the name here.
-    """
-    if "*" in pattern or "?" in pattern:
-        return None
-    cleaned = pattern.strip()
-    if re.fullmatch(r"[A-Za-z]:[\\/]*", cleaned):
-        return os.path.abspath(cleaned[:2] + os.sep)
-    if not (re.match(r"[A-Za-z]:[\\/]", cleaned) or cleaned.startswith(("\\\\", "//")) or os.path.isabs(cleaned)):
-        return None
-    return os.path.abspath(cleaned.rstrip("\\/"))
-
-
-def check_exclude_patterns(patterns: list[str] | None, root_abs: str) -> None:
-    """Stop before planning if an --exclude pattern can't be what was meant."""
-    for pattern in patterns or []:
-        if '"' in pattern:
-            raise SystemExit(
-                f"ERROR: --exclude {pattern!r} contains a quote. In PowerShell, a path ending in a "
-                'backslash followed by a quote ("R:\\folder\\") passes the quote on: write the folder '
-                'without the trailing backslash ("R:\\folder"), or in single quotes. No plan was written.'
-            )
-        folder = exclude_folder(pattern)
-        if folder is not None and relative_to_root(folder, root_abs) is None:
-            raise SystemExit(
-                f"ERROR: --exclude {pattern!r} is a folder that isn't under --root '{root_abs}'. "
-                "Write it as the listing does (same drive letter or \\\\server\\share spelling). "
-                "No plan was written."
-            )
-
-
-def build_exclude_matcher(patterns: list[str]) -> Callable[[str], str | None]:
-    """
-    Return a function giving the first pattern a path matches (or None),
-    case-insensitively. A plain folder path (see exclude_folder) matches
-    everything in that folder and below; any other pattern is a wildcard
-    matched against both the file name ('thumbs.db', '*.ini') and the full
-    path ('*\\.git\\*', 'R:\\Old\\*').
-    """
-    rules = []
-    for original in patterns:
-        folder = exclude_folder(original)
-        if folder is not None:
-            rules.append((original, True, os.path.normcase(folder).rstrip("\\/") + os.sep))
-        else:
-            rules.append((original, False, os.path.normcase(original)))
-
-    def _match(path: str) -> str | None:
-        full = os.path.normcase(path)
-        name = os.path.basename(full)
-        for original, is_folder, value in rules:
-            if is_folder:
-                if full.startswith(value):
-                    return original
-            elif fnmatch.fnmatchcase(name, value) or fnmatch.fnmatchcase(full, value):
-                return original
-        return None
-
-    return _match
-
-
-def report_excludes(patterns: list[str] | None, counts: Counter, unit: str, hint: str = "") -> None:
-    """Per --exclude pattern, how many files it excluded; a warning for those that excluded none."""
-    for pattern in patterns or []:
-        n = counts.get(pattern, 0)
-        kind = "folder" if exclude_folder(pattern) is not None else "pattern"
-        print(f"  --exclude {pattern!r} ({kind}): {n} {unit}")
-        if n == 0:
-            print(
-                f"  WARNING: --exclude {pattern!r} matched nothing.{hint} Check its spelling: a folder must be "
-                "written as in the listing (same drive letter or \\\\server\\share); a wildcard pattern must "
-                "match the whole path (e.g. '*\\Old Data\\*')."
-            )
 
 
 class PlanContext:
@@ -756,7 +385,7 @@ def build_block(block: pd.DataFrame, ctx: PlanContext) -> pd.DataFrame:
         if relative is None:
             raise SystemExit(
                 f"ERROR: '{original}' in the duplicates list is not under --root "
-                f"'{ctx.root_abs}'. Use the folder-mode output of duplicates_check.py for "
+                f"'{ctx.root_abs}'. Use the folder-mode output of duplicates_check_V2.py for "
                 "this same root (and the same drive letter or \\\\server\\share spelling). "
                 "No plan was written."
             )
@@ -873,7 +502,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     if not os.path.isdir(to_long_path(root_abs)):
         raise SystemExit(f"ERROR: --root does not exist or is not a folder: {root_abs}")
     duplicates_dir = os.path.join(root_abs, DUPLICATES_FOLDER_NAME)
-    check_output_folder(args.output, duplicates_dir)
+    check_output_folder(args.output, duplicates_dir, OUTPUT_INSIDE_WHY)
 
     ctx = PlanContext(args, root_abs, load_keepers(args.summary_csv))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -917,6 +546,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     partial_path.replace(plan_path)
 
     settings = {
+        "script": SCRIPT_NAME,
         "plan_format": PLAN_FORMAT,
         "created_at": _now(),
         "root": root_abs,
@@ -947,7 +577,7 @@ def cmd_plan(args: argparse.Namespace) -> None:
     print(f"Settings written to: {settings_path(plan_path)}")
     print(
         "\nReview the plan (you may change 'action' from MOVE to SKIP for any row), then run:\n"
-        f'  python quarantine_duplicates.py execute --plan "{plan_path}"'
+        f'  python quarantine_duplicates_V2.py execute --plan "{plan_path}"'
     )
 
 
@@ -957,9 +587,9 @@ def cmd_plan(args: argparse.Namespace) -> None:
 
 def cmd_execute(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT, unnamed_is_mine=True)
     prefix = output_prefix(plan_path, args.output)
-    check_output_folder(prefix.parent, settings["duplicates_dir"])
+    check_output_folder(prefix.parent, settings["duplicates_dir"], OUTPUT_INSIDE_WHY)
     timeout = args.io_timeout
 
     total_moves = validate_plan(plan_path)
@@ -1074,7 +704,7 @@ def cmd_execute(args: argparse.Namespace) -> None:
         executor = ThreadPoolExecutor(max_workers=args.workers)
         try:
             with tqdm(total=total_moves, desc="Moving duplicates", unit="file") as progress:
-                for chunk in iter_plan(plan_path):
+                for chunk in iter_plan(plan_path, PLAN_COLUMNS):
                     chunk = chunk[chunk["action"] == "MOVE"]
                     if retry_keys is not None:
                         chunk = chunk[np.isin(hash_array(chunk["original_path"], len(chunk)), retry_keys)]
@@ -1179,7 +809,7 @@ def run_verify(plan_path: Path, settings: dict, prefix: Path, args: argparse.Nam
             counts[status] += 1
 
         with tqdm(total=count_rows(plan_path), desc="Comparing with the plan", unit="row") as progress:
-            for chunk in iter_plan(plan_path):
+            for chunk in iter_plan(plan_path, PLAN_COLUMNS):
                 for row in chunk.itertuples(index=False):
                     if row.action == "SKIP":
                         _write(f"SKIPPED_{row.reason}", row.detail, row, None)
@@ -1265,7 +895,7 @@ def run_verify_retried(plan_path: Path, prefix: Path, retry_keys: np.ndarray, ar
     with CsvAppender(report_path, VERIFY_COLUMNS, append=False) as report, \
             ThreadPoolExecutor(max_workers=args.workers) as executor, \
             tqdm(total=len(retry_keys), desc="Verifying retried files", unit="file") as progress:
-        for chunk in iter_plan(plan_path):
+        for chunk in iter_plan(plan_path, PLAN_COLUMNS):
             chunk = chunk[chunk["action"] == "MOVE"]
             rows = list(chunk[np.isin(hash_array(chunk["original_path"], len(chunk)), retry_keys)].itertuples(index=False))
             for row, (status, detail, (size_found, mtime_found, md5_found)) in zip(
@@ -1289,9 +919,9 @@ def run_verify_retried(plan_path: Path, prefix: Path, retry_keys: np.ndarray, ar
 
 def cmd_verify(args: argparse.Namespace) -> None:
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT, unnamed_is_mine=True)
     prefix = output_prefix(plan_path, args.output)
-    check_output_folder(prefix.parent, settings["duplicates_dir"])
+    check_output_folder(prefix.parent, settings["duplicates_dir"], OUTPUT_INSIDE_WHY)
     run_verify(plan_path, settings, prefix, args)
 
 
@@ -1307,7 +937,7 @@ def cmd_undo(args: argparse.Namespace) -> None:
     after an interruption. Notes are rewritten once per folder per block.
     """
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT, unnamed_is_mine=True)
     prefix = output_prefix(plan_path, args.output)
     duplicates_dir = settings["duplicates_dir"]
     timeout = args.io_timeout
@@ -1409,7 +1039,7 @@ def cmd_undo(args: argparse.Namespace) -> None:
 
 def default_raw_csv(settings: dict) -> Path:
     """
-    duplicates_check.py writes `<stem>_folder_duplicates.csv` and
+    duplicates_check_V2.py writes `<stem>_folder_duplicates.csv` and
     `<stem>_raw.csv` side by side (see its raw_export_path), so the raw
     listing can be found from the duplicates CSV the plan was built from.
     """
@@ -1422,23 +1052,23 @@ def default_raw_csv(settings: dict) -> Path:
 def cmd_remaining(args: argparse.Namespace) -> None:
     """
     Derive the raw listing of what stays on the volume once <root>\\duplicates
-    is deleted, without rehashing it: duplicates_check.py's raw listing,
+    is deleted, without rehashing it: duplicates_check_V2.py's raw listing,
     minus every file currently moved out (per the journal and undo
     journal), minus anything already under <root>\\duplicates, plus the
     original_file_location.txt notes (tiny, so they are hashed fresh).
     Same columns as the raw listing, so it works anywhere that one does
-    (storage_report_by_year.R, duplicates_check.py --resume-from).
+    (storage_report_by_year.R, duplicates_check_V2.py --resume-from).
     The raw listing is streamed in blocks, so its size doesn't matter.
     """
     plan_path = Path(args.plan)
-    settings = load_settings(plan_path)
+    settings = load_settings(plan_path, SCRIPT_NAME, PLAN_FORMAT, unnamed_is_mine=True)
     prefix = output_prefix(plan_path, args.output)
-    check_output_folder(prefix.parent, settings["duplicates_dir"])
+    check_output_folder(prefix.parent, settings["duplicates_dir"], OUTPUT_INSIDE_WHY)
     raw_path = Path(args.raw_csv) if args.raw_csv else default_raw_csv(settings)
     if not raw_path.is_file():
         raise SystemExit(
             f"ERROR: raw listing not found: {raw_path}. Pass --raw-csv with the "
-            "'<stem>_raw.csv' that duplicates_check.py wrote for this scan."
+            "'<stem>_raw.csv' that duplicates_check_V2.py wrote for this scan."
         )
     timeout = args.io_timeout
 
@@ -1462,7 +1092,7 @@ def cmd_remaining(args: argparse.Namespace) -> None:
             missing_columns = [c for c in RAW_COLUMNS if c not in chunk.columns]
             if missing_columns:
                 raise SystemExit(
-                    f"ERROR: '{raw_path}' is missing column(s) {missing_columns}. Use duplicates_check.py's "
+                    f"ERROR: '{raw_path}' is missing column(s) {missing_columns}. Use duplicates_check_V2.py's "
                     "final raw listing (the pre-hash one written early in a scan has no md5)."
                 )
             keep = np.empty(len(chunk), dtype=bool)
@@ -1526,7 +1156,7 @@ def cmd_remaining(args: argparse.Namespace) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Move duplicate files (from duplicates_check.py --folder) into a "
+            "Move duplicate files (from duplicates_check_V2.py --folder) into a "
             f"'{DUPLICATES_FOLDER_NAME}' folder under the same root, keeping the "
             "oldest copy in place, then verify the move by md5."
         )
@@ -1544,9 +1174,9 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--threading", action="store_true", help="Hash files concurrently (with --workers threads) during verification.")
 
     plan = sub.add_parser("plan", help="Dry run: build and write the move plan. Moves nothing.")
-    plan.add_argument("--duplicates-csv", required=True, help="The <stem>_folder_duplicates.csv from duplicates_check.py --folder.")
+    plan.add_argument("--duplicates-csv", required=True, help="The <stem>_folder_duplicates.csv from duplicates_check_V2.py --folder.")
     plan.add_argument("--summary-csv", required=True, help="The <stem>_folder_summary.csv from the same run.")
-    plan.add_argument("--root", required=True, help="The folder that was scanned (the --folder of duplicates_check.py).")
+    plan.add_argument("--root", required=True, help="The folder that was scanned (the --folder of duplicates_check_V2.py).")
     plan.add_argument("--output", required=True, help="Folder to write the plan and, later, all reports into.")
     plan.add_argument(
         "--min-size", type=parse_size, default=0,
@@ -1597,7 +1227,7 @@ def parse_args() -> argparse.Namespace:
     remaining.add_argument("--plan", required=True, help="The move_plan_<timestamp>.csv that was executed.")
     remaining.add_argument(
         "--raw-csv",
-        help="duplicates_check.py's final '<stem>_raw.csv' for the same scan. Default: found next to the plan's --duplicates-csv.",
+        help="duplicates_check_V2.py's final '<stem>_raw.csv' for the same scan. Default: found next to the plan's --duplicates-csv.",
     )
     remaining.add_argument("--output", help="Folder with that plan's journal; the listing is written there too. Default: the plan's folder.")
     _common(remaining, "Threads for hashing the location notes.")

@@ -8,11 +8,23 @@ below, in the order they are used:
 
 | Step | Script | Purpose |
 |---|---|---|
-| 1. Analyse | [`duplicates_check.py`](#duplicates_checkpy) | Scans one or two folders for duplicate files (by MD5) and verifies backups against their source. |
-| 1. Analyse | [`elimination_file_candidates.py`](#elimination_file_candidatespy) | Scans a folder for files that are candidates for elimination (old files, ZIP files, files in `Unmixed` folders). Independent of `duplicates_check.py`, but run at the same step: it also gives insight into the data before anything is eliminated. |
-| 2. Clean up | [`quarantine_duplicates.py`](#quarantine_duplicatespy) | Uses the duplicate list from `duplicates_check.py --folder` to move every copy but the oldest into a reversible `duplicates` quarantine folder. |
-| 3. Archive | [`archive_old_files.py`](#archive_old_filespy) | Moves the files modified in a date range into a `move_to_archive` folder (same folder structure), ready to be copied to tape by hand. Scans the storage itself, or reuses the newest raw listing. |
+| 1. Analyse | [`duplicates_check_V2.py`](#duplicates_check_v2py) | Scans one or two folders for duplicate files (by MD5) and verifies backups against their source. |
+| 1. Analyse | [`elimination_file_candidates_V2.py`](#elimination_file_candidates_v2py) | Scans a folder for files that are candidates for elimination (old files, ZIP files, files in `Unmixed` folders). Independent of `duplicates_check_V2.py`, but run at the same step: it also gives insight into the data before anything is eliminated. |
+| 2. Clean up | [`quarantine_duplicates_V2.py`](#quarantine_duplicates_v2py) | Uses the duplicate list from `duplicates_check_V2.py --folder` to move every copy but the oldest into a reversible `duplicates` quarantine folder. |
+| 3. Archive | [`archive_old_files_V2.py`](#archive_old_files_v2py) | Moves the files modified in a date range into a `move_to_archive` folder (same folder structure), ready to be copied to tape by hand. Scans the storage itself, or reuses the newest raw listing. |
 | When needed | [`change_folder_permissions.py`](#change_folder_permissionspy) | Standalone, run by hand: gives an account Modify on a folder tree (e.g. when `execute` fails with *Access is denied*), later reduces everyone else to read only, and restores the previous permissions. |
+
+The four pipeline scripts share their helpers (scanning, hashing, plan and
+journal files) through `diogenes_common.py`. Each one needs only that file
+next to it, not any of the other scripts: to use a script elsewhere, copy it
+together with `diogenes_common.py`.
+
+The `_V2` scripts are this version. The original scripts, from before
+`diogenes_common.py`, are kept unchanged in [`old_scripts/`](old_scripts/);
+they import from each other, so all four must stay together in that folder.
+Both versions write and read the same files (plans, settings, journals,
+notes), so a plan made by one version can be executed, verified or undone by
+the other.
 
 The R scripts used for reporting live in [`R_plots/`](R_plots/). The
 scripts that generate test data live in [`support_scripts/`](support_scripts/),
@@ -24,7 +36,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
 
 ## Table of contents
 
-- [duplicates_check.py](#duplicates_checkpy)
+- [duplicates_check_V2.py](#duplicates_check_v2py)
   - [What it does](#what-it-does)
   - [Requirements](#requirements)
   - [Usage](#usage)
@@ -33,7 +45,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
   - [Memory use on large scans](#memory-use-on-large-scans)
   - [Arguments](#arguments)
   - [Notes](#notes)
-- [elimination_file_candidates.py](#elimination_file_candidatespy)
+- [elimination_file_candidates_V2.py](#elimination_file_candidates_v2py)
   - [What it does](#what-it-does-1)
   - [Why "summed" and "unique" differ globally](#why-summed-and-unique-differ-globally)
   - [Requirements](#requirements-1)
@@ -41,7 +53,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
   - [Arguments](#arguments-1)
   - [Generating test data](#generating-test-data-1)
   - [Notes](#notes-1)
-- [quarantine_duplicates.py](#quarantine_duplicatespy)
+- [quarantine_duplicates_V2.py](#quarantine_duplicates_v2py)
   - [Workflow at a glance](#workflow-at-a-glance)
   - [What happens to the files](#what-happens-to-the-files)
   - [Requirements](#requirements-2)
@@ -54,7 +66,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
   - [Output files (in `--output`)](#output-files-in---output)
   - [Design decisions](#design-decisions)
   - [Notes](#notes-2)
-- [archive_old_files.py](#archive_old_filespy)
+- [archive_old_files_V2.py](#archive_old_files_v2py)
   - [Workflow at a glance](#workflow-at-a-glance-1)
   - [What happens to the files and folders](#what-happens-to-the-files-and-folders)
   - [Notes: where every file went](#notes-where-every-file-went)
@@ -71,7 +83,7 @@ The whole pipeline has been positively tested in WindowsOS 11 in storage volumes
 
 ---
 
-## duplicates_check.py
+## duplicates_check_V2.py
 
 Scans one or two folders for duplicate files (by MD5 checksum) and, when given
 an origin/destination pair, verifies that a backup is a faithful copy of its
@@ -109,6 +121,9 @@ to keep that one file and safely delete the rest of the group.
 pip install pandas tqdm
 ```
 
+`duplicates_check_V2.py` imports its scanning helpers from `diogenes_common.py`,
+so both files must stay in the same folder.
+
 ### Usage
 
 Run from the repository root.
@@ -119,13 +134,13 @@ Runs all checks: origin duplicates, destination duplicates, cross-folder
 duplicates, and integrity comparison.
 
 ```powershell
-python duplicates_check.py --origin "C:\path\to\origin" --destination "C:\path\to\destination"
+python duplicates_check_V2.py --origin "C:\path\to\origin" --destination "C:\path\to\destination"
 ```
 
 #### Scan a single folder for duplicates
 
 ```powershell
-python duplicates_check.py --folder "C:\path\to\folder"
+python duplicates_check_V2.py --folder "C:\path\to\folder"
 ```
 
 #### Run only one check
@@ -133,8 +148,8 @@ python duplicates_check.py --folder "C:\path\to\folder"
 Use `--mode` with an origin/destination pair:
 
 ```powershell
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode integrity
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --mode between
+python duplicates_check_V2.py --origin "C:\origin" --destination "C:\destination" --mode integrity
+python duplicates_check_V2.py --origin "C:\origin" --destination "C:\destination" --mode between
 ```
 
 The folders you give decide how far the analysis goes; `--mode` only picks
@@ -154,7 +169,7 @@ Add `--excel` with a target path to additionally write every result table to
 its own CSV file. Omit it to only print to the terminal.
 
 ```powershell
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --excel "C:\reports\duplicates_report.xlsx"
+python duplicates_check_V2.py --origin "C:\origin" --destination "C:\destination" --excel "C:\reports\duplicates_report.xlsx"
 ```
 
 Despite the flag's name (kept as `--excel` since that's the established
@@ -206,7 +221,7 @@ pre-hash version, or a final one from a previous run) instead of `--folder`/
 `--origin`/`--destination`'s usual walk:
 
 ```powershell
-python duplicates_check.py --folder "C:\path\to\folder" --excel "C:\reports\duplicates_report.xlsx" --resume-from "C:\reports\duplicates_report_raw.csv"
+python duplicates_check_V2.py --folder "C:\path\to\folder" --excel "C:\reports\duplicates_report.xlsx" --resume-from "C:\reports\duplicates_report_raw.csv"
 ```
 
 This reuses the file list from that export but still re-collects each
@@ -241,14 +256,14 @@ volume that allows several users at once, or a local SSD/NVMe — add
 `--threading` to hash several files in parallel:
 
 ```powershell
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --threading
+python duplicates_check_V2.py --origin "C:\origin" --destination "C:\destination" --threading
 ```
 
 `--threading` uses 8 worker threads by default. Tune that with `--workers`
 (only valid together with `--threading`):
 
 ```powershell
-python duplicates_check.py --origin "C:\origin" --destination "C:\destination" --threading --workers 16
+python duplicates_check_V2.py --origin "C:\origin" --destination "C:\destination" --threading --workers 16
 ```
 
 Notes on choosing a worker count:
@@ -274,8 +289,8 @@ time/RAM, or to skip a subfolder you know is slow/irrelevant — use
 `--included` or `--excluded` (not both) with one or more paths:
 
 ```powershell
-python duplicates_check.py --folder "C:\path\to\folder" --included "C:\path\to\folder\2023" "C:\path\to\folder\2024"
-python duplicates_check.py --folder "C:\path\to\folder" --excluded "C:\path\to\folder\Trash"
+python duplicates_check_V2.py --folder "C:\path\to\folder" --included "C:\path\to\folder\2023" "C:\path\to\folder\2024"
+python duplicates_check_V2.py --folder "C:\path\to\folder" --excluded "C:\path\to\folder\Trash"
 ```
 
 `--included` and `--excluded` both apply to whichever folder(s) the current
@@ -369,7 +384,7 @@ enough to watch its own hash crawl along — they're independent knobs.
 
 For `--mode all` it creates:
 
-- `folder_test\` — for `duplicates_check.py --folder ...`: unique
+- `folder_test\` — for `duplicates_check_V2.py --folder ...`: unique
   files, a small duplicate group, and a large duplicate pair.
 - `origin\` and `destination\` — for the origin/destination modes:
   - a duplicate group inside `origin\` only, and one inside `destination\`
@@ -384,7 +399,7 @@ For `--mode all` it creates:
 For any other `--mode`, only the fixtures relevant to that check are built
 (plus a baseline file so origin/destination are never empty).
 
-It prints the exact `duplicates_check.py` command to run against the
+It prints the exact `duplicates_check_V2.py` command to run against the
 generated data. `UNREADABLE` status isn't simulated, since that requires
 OS-level permission changes rather than file content.
 
@@ -488,7 +503,7 @@ final export, which builds a second full table, is the next thing to trim.
   hash) therefore uses the Windows extended-length form `\\?\C:\...` /
   `\\?\UNC\server\share\...`, which lifts the limit regardless of that
   setting. Paths in every output keep their normal form. This also applies
-  to `elimination_file_candidates.py` and `quarantine_duplicates.py`, which
+  to `elimination_file_candidates_V2.py` and `quarantine_duplicates_V2.py`, which
   reuse these helpers.
 - A folder or file that can't be accessed at all is skipped rather than
   aborting the whole scan — whether it fails fast (permission denied, a
@@ -520,7 +535,7 @@ final export, which builds a second full table, is the next thing to trim.
 
 ---
 
-## elimination_file_candidates.py
+## elimination_file_candidates_V2.py
 
 This is a script to detect specific formats/folders that the user is interested to eliminate, others than duplicates. It is now tailored to (spectral) flowcytometry, but you can fork it and add another requirements. Concretely, it scans a folder (recursively, across all subfolders) for files that are candidates for elimination, so you know what could be safely deleted and how much space it would free up.
 
@@ -571,9 +586,8 @@ silently double-counted:
 pip install pandas tqdm matplotlib openpyxl
 ```
 
-`elimination_file_candidates.py` also imports `validate_folder` and
-`export_results_to_excel` from `duplicates_check.py`, so both files must stay
-in the same folder.
+`elimination_file_candidates_V2.py` imports its scanning and export helpers from
+`diogenes_common.py`, so both files must stay in the same folder.
 
 ### Usage
 
@@ -582,13 +596,13 @@ Run from the repository root.
 #### Basic scan
 
 ```powershell
-python elimination_file_candidates.py --folder "C:\path\to\folder"
+python elimination_file_candidates_V2.py --folder "C:\path\to\folder"
 ```
 
 #### Also export full results to Excel
 
 ```powershell
-python elimination_file_candidates.py --folder "C:\path\to\folder" --excel "C:\reports\elimination_candidates.xlsx"
+python elimination_file_candidates_V2.py --folder "C:\path\to\folder" --excel "C:\reports\elimination_candidates.xlsx"
 ```
 
 This writes the workbook itself (`summary` and `skipped_folders` sheets —
@@ -598,10 +612,10 @@ see Notes below) plus several companion CSVs next to it:
   of group (`filename`, `path`, `mtime`, `size_gb`). Written as soon as the
   scan finishes, since the walk/stat step already covers every file no
   matter which groups you asked for — this is effectively free. Same
-  columns as `duplicates_check.py`'s own raw export (minus `md5`, since
+  columns as `duplicates_check_V2.py`'s own raw export (minus `md5`, since
   this script never hashes), so it also works as a `--resume-from` input
   there — see [Resume an interrupted scan](#resume-an-interrupted-scan) in
-  the `duplicates_check.py` section for using it to scope a duplicate scan to a
+  the `duplicates_check_V2.py` section for using it to scope a duplicate scan to a
   particular subset of files without re-walking the folder.
 - `elimination_candidates_old_files.csv`, `..._zip_files.csv`, and
   `..._unmixed_files.csv` — one per group, each a full listing of just the
@@ -617,14 +631,14 @@ writes much faster besides.
 Default is 10 years.
 
 ```powershell
-python elimination_file_candidates.py --folder "C:\path\to\folder" --years 5
+python elimination_file_candidates_V2.py --folder "C:\path\to\folder" --years 5
 ```
 
 #### Change where barplots are saved, or skip them
 
 ```powershell
-python elimination_file_candidates.py --folder "C:\path\to\folder" --plots-dir "C:\reports\plots"
-python elimination_file_candidates.py --folder "C:\path\to\folder" --no-plots
+python elimination_file_candidates_V2.py --folder "C:\path\to\folder" --plots-dir "C:\reports\plots"
+python elimination_file_candidates_V2.py --folder "C:\path\to\folder" --no-plots
 ```
 
 ### Arguments
@@ -652,17 +666,17 @@ python support_scripts\generate_elimination_test_data.py --path "C:\path\to\test
 |---------------|-------------------------------------------------------------------------------------------------|
 | `--path`      | Base folder where the test folder will be created. Required.                                    |
 | `--mode`      | Which group to build a scenario for: `all` (default), `old`, `zip`, `unmixed`.                  |
-| `--years`     | Age threshold (in years) to build fixtures around — pass the same value to `elimination_file_candidates.py --years`. Default: **10**. |
+| `--years`     | Age threshold (in years) to build fixtures around — pass the same value to `elimination_file_candidates_V2.py --years`. Default: **10**. |
 | `--num-files` | Multiplier applied to every fixture group, keeping proportions fixed while scaling up total file count. Default: **1**. |
 | `--clean`     | Remove this script's own previously generated subfolder (`elimination_test`) under `--path` before regenerating. Never touches anything else under `--path`. |
 
-It prints the exact `elimination_file_candidates.py` command to run against
+It prints the exact `elimination_file_candidates_V2.py` command to run against
 the generated data.
 
 ### Notes
 
 - "Old" is based on file **modification time** (not creation time), for the
-  same reason as in `duplicates_check.py` — it's consistent across platforms
+  same reason as in `duplicates_check_V2.py` — it's consistent across platforms
   and survives files being copied to a new location.
 - Files that can't be `stat()`'d (permission errors, etc.) are treated as
   size 0 and excluded from the "old files" check (their real age is
@@ -694,19 +708,19 @@ the generated data.
   in the `skipped_folders` sheet (scope, folder, error).
 - **Long paths (over 260 characters) are scanned too**, regardless of the
   Windows `LongPathsEnabled` setting: folder listing and `stat` go through
-  `duplicates_check.py`'s helpers, which use the extended-length form
+  `duplicates_check_V2.py`'s helpers, which use the extended-length form
   `\\?\C:\...` / `\\?\UNC\server\share\...` for every filesystem call.
   Paths in the outputs keep their normal form. See "Long paths" in the
-  [`duplicates_check.py` notes](#notes).
-- No file hashing is done here (unlike `duplicates_check.py`) — only
+  [`duplicates_check_V2.py` notes](#notes).
+- No file hashing is done here (unlike `duplicates_check_V2.py`) — only
   filename, path, size, and modification time are needed, so scanning is
   fast even on large folders.
 
 ---
 
-## quarantine_duplicates.py
+## quarantine_duplicates_V2.py
 
-Takes the duplicate list produced by `duplicates_check.py --folder` and, for
+Takes the duplicate list produced by `duplicates_check_V2.py --folder` and, for
 every group of identical files (same md5), keeps the **oldest** copy where it
 is and moves every other copy into a `duplicates` folder under the same
 storage root. The oldest file is kept because the oldest file is "a priori" the first generated, so the "rawest". Duplicates come from this very first (and oldest) file. 
@@ -720,16 +734,16 @@ reversed with `undo`.
 ### Workflow at a glance
 
 ```
-duplicates_check.py --folder ROOT --excel scan.xlsx
+duplicates_check_V2.py --folder ROOT --excel scan.xlsx
         │  scan_folder_duplicates.csv + scan_folder_summary.csv
         ▼
-quarantine_duplicates.py plan      → move_plan_<timestamp>.csv   (dry run, review it)
+quarantine_duplicates_V2.py plan      → move_plan_<timestamp>.csv   (dry run, review it)
         ▼
-quarantine_duplicates.py execute   → moves + notes + journal, then verify
+quarantine_duplicates_V2.py execute   → moves + notes + journal, then verify
         ▼
-quarantine_duplicates.py verify    → (optional) re-run the md5 check alone
-quarantine_duplicates.py undo      → (optional) put everything back
-quarantine_duplicates.py remaining → raw listing of what stays after deleting `duplicates`, no rehash
+quarantine_duplicates_V2.py verify    → (optional) re-run the md5 check alone
+quarantine_duplicates_V2.py undo      → (optional) put everything back
+quarantine_duplicates_V2.py remaining → raw listing of what stays after deleting `duplicates`, no rehash
 ```
 
 ### What happens to the files
@@ -757,23 +771,24 @@ were all moved keeps only its note. That is intended.
 - Python 3.10+
 - `pandas`, `tqdm`
 
-`quarantine_duplicates.py` imports helpers from `duplicates_check.py`, so both
-files must stay in the same folder.
+`quarantine_duplicates_V2.py` imports its helpers from `diogenes_common.py`, so
+both files must stay in the same folder. It doesn't need `duplicates_check_V2.py`
+itself, only the CSVs it wrote.
 
 ### Inputs: which file goes into which option
 
-Every input comes from **one single run of `duplicates_check.py` in folder
+Every input comes from **one single run of `duplicates_check_V2.py` in folder
 mode** (`--folder`) on the storage you want to clean. For example:
 
 ```powershell
-python duplicates_check.py --folder "R:\" --excel "C:\reports\duplicates_analysis\duplicates_report.xlsx"
+python duplicates_check_V2.py --folder "R:\" --excel "C:\reports\duplicates_analysis\duplicates_report.xlsx"
 ```
 
 In folder mode, `--excel` only sets the **folder and base name** of the
 outputs. No `.xlsx` workbook is written; instead you get these CSVs next to
 where the workbook would be:
 
-| File written by duplicates_check.py | Contents | Used by quarantine_duplicates.py as |
+| File written by duplicates_check_V2.py | Contents | Used by quarantine_duplicates_V2.py as |
 |---|---|---|
 | `duplicates_report_folder_duplicates.csv` | one row per duplicated file: `path, filename, size_bytes, mtime, md5` | `plan --duplicates-csv` |
 | `duplicates_report_folder_summary.csv` | one row per md5 group, incl. `oldest_path` (the keeper) | `plan --summary-csv` |
@@ -784,7 +799,7 @@ The other options are not files from the analysis:
 
 | Option | What to give |
 |---|---|
-| `plan --root` | **Exactly the same folder** given to `duplicates_check.py --folder`, in the same spelling (`R:\` and `\\server\share\` count as different). `duplicates` is created directly under it. |
+| `plan --root` | **Exactly the same folder** given to `duplicates_check_V2.py --folder`, in the same spelling (`R:\` and `\\server\share\` count as different). `duplicates` is created directly under it. |
 | `plan --output` | Any folder for the plan and all reports, e.g. `C:\reports\quarantine`. Not inside `<root>\duplicates`. |
 | `execute` / `verify` / `undo` / `remaining` `--plan` | The `move_plan_<timestamp>.csv` that `plan` wrote into `--output`. Its `_settings.json` must stay next to it: it records the root and the two input CSVs, which is why these commands need no other input. |
 
@@ -797,7 +812,7 @@ Rules:
 - **Leave the input CSVs where they are** until you've finished with this
   plan. `execute` re-reads them (through the settings file) to check that
   the plan wasn't changed beyond `MOVE`↔`SKIP`.
-- **Use the final raw CSV, not the early one.** duplicates_check.py writes
+- **Use the final raw CSV, not the early one.** duplicates_check_V2.py writes
   `_raw.csv` once before hashing (no `md5` column) and overwrites it when
   the scan finishes. If the scan was interrupted, `remaining` refuses the
   md5-less file.
@@ -814,14 +829,14 @@ Rules:
 Full example with the files above:
 
 ```powershell
-python quarantine_duplicates.py plan `
+python quarantine_duplicates_V2.py plan `
     --duplicates-csv "C:\reports\duplicates_analysis\duplicates_report_folder_duplicates.csv" `
     --summary-csv    "C:\reports\duplicates_analysis\duplicates_report_folder_summary.csv" `
     --root   "R:\" `
     --output "C:\reports\quarantine"
 
-python quarantine_duplicates.py execute   --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
-python quarantine_duplicates.py remaining --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+python quarantine_duplicates_V2.py execute   --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+python quarantine_duplicates_V2.py remaining --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
 ```
 
 ### Usage
@@ -831,7 +846,7 @@ Run from the repository root.
 #### 0. Scan for duplicates (folder mode)
 
 ```powershell
-python duplicates_check.py --folder "R:\" --excel "C:\reports\scan.xlsx" --excluded "R:\duplicates"
+python duplicates_check_V2.py --folder "R:\" --excel "C:\reports\scan.xlsx" --excluded "R:\duplicates"
 ```
 
 Use `--excluded "R:\duplicates"` once a `duplicates` folder exists. Otherwise
@@ -841,7 +856,7 @@ step refuses such groups anyway (`IN_DUPLICATES_FOLDER`).
 #### 1. Plan (dry run, moves nothing)
 
 ```powershell
-python quarantine_duplicates.py plan `
+python quarantine_duplicates_V2.py plan `
     --duplicates-csv "C:\reports\scan_folder_duplicates.csv" `
     --summary-csv    "C:\reports\scan_folder_summary.csv" `
     --root   "R:\" `
@@ -864,7 +879,7 @@ The plan has one row per file in the duplicate list:
 | `action` | `MOVE`, `SKIP` or `KEEP` (the keeper) |
 | `reason`, `detail` | why a row is `SKIP` (see *Skip reasons*) |
 | `role` | `keeper`, `duplicate` (may be moved), or `blocked` (its group can't be moved, see `reason`) |
-| `md5`, `size_bytes`, `size_gb`, `mtime`, `modified` | from the scan (`modified` is UTC, like duplicates_check.py) |
+| `md5`, `size_bytes`, `size_gb`, `mtime`, `modified` | from the scan (`modified` is UTC, like duplicates_check_V2.py) |
 | `original_path` | where the file is now |
 | `duplicates_path` | where it will go |
 | `keeper_path`, `keeper_size_bytes`, `keeper_mtime` | the copy that stays, and its scan size/mtime |
@@ -879,7 +894,7 @@ sensible places: "oldest" is not always "the right one".
 would do, in number of files *and* in storage space. The two can differ a
 lot: on Volume B, most of the volume's files could be moved but only a
 small share of its space, because most duplicates are small files. Set `plan_path`, `raw_path`
-(duplicates_check.py's `_raw.csv` of the same scan) and `output_folder` in
+(duplicates_check_V2.py's `_raw.csv` of the same scan) and `output_folder` in
 the configuration block, run section **0. Setup** once, then run any section
 on its own, in any order (RStudio: Ctrl+Alt+T runs the current section).
 Each section shows its plot; its last line exports it into `output_folder`
@@ -918,7 +933,7 @@ are refused. Re-run `plan`.
 #### 2. Execute
 
 ```powershell
-python quarantine_duplicates.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+python quarantine_duplicates_V2.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
 ```
 
 It does the following:
@@ -941,7 +956,7 @@ which is slow on a large volume. To retry only the files whose latest result is
 `ERROR`, `MOVE_FAILED` or `MOVE_TIMEOUT`, add `--retry-failed`:
 
 ```powershell
-python quarantine_duplicates.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --retry-failed
+python quarantine_duplicates_V2.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --retry-failed
 ```
 
 The same checks are run on each retried file. Its results go to
@@ -965,7 +980,7 @@ nothing unresolved is touched:
 | | Or, if the destination copy is the right one, delete the original. | The destination matches the scan → `MOVED_RESUMED`. |
 | `CONFLICT` (*original is gone and the file at the destination differs from the scan*) | The file was changed after the move; a re-run reports it as `CONFLICT` again. Decide by hand: move it back and make a new plan, or accept it as is (it stays out of the journal). | `CONFLICT` again. |
 | `MISSING` | Put the original back. | Moves it as usual → `MOVED`. |
-| `SKIPPED_*` | The keeper or the duplicate changed since the scan; the checks compare against the scan, so they're skipped again. | Re-scan with duplicates_check.py and make a new plan. |
+| `SKIPPED_*` | The keeper or the duplicate changed since the scan; the checks compare against the scan, so they're skipped again. | Re-scan with duplicates_check_V2.py and make a new plan. |
 
 Verify then checks only the retried files: it hashes each one at its
 destination instead of re-hashing the whole duplicates folder, and writes
@@ -979,7 +994,7 @@ check of the folder.
 Runs automatically after `execute`. Run it alone with:
 
 ```powershell
-python quarantine_duplicates.py verify --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --threading
+python quarantine_duplicates_V2.py verify --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --threading
 ```
 
 It re-hashes **every file under `<root>\duplicates`** and matches it to the
@@ -1021,7 +1036,7 @@ the plot:
 #### 4. Undo (if needed)
 
 ```powershell
-python quarantine_duplicates.py undo --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+python quarantine_duplicates_V2.py undo --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
 ```
 
 Moves every journaled file back, removes its line from
@@ -1034,13 +1049,13 @@ it's reported as `CONFLICT`. Writes `<plan>_undo_journal.csv` and
 #### 5. Raw listing of the remaining files (no rehash)
 
 ```powershell
-python quarantine_duplicates.py remaining --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
+python quarantine_duplicates_V2.py remaining --plan "C:\reports\quarantine\move_plan_20261006_121052.csv"
 ```
 
 Writes `<plan>_remaining_raw.csv`: the volume's file listing as it will be
 once you delete `duplicates`, without rehashing the volume. It is built from:
 
-- duplicates_check.py's raw listing of the scan (`<stem>_raw.csv`, found next
+- duplicates_check_V2.py's raw listing of the scan (`<stem>_raw.csv`, found next
   to the plan's `--duplicates-csv`, or given with `--raw-csv`),
 - **minus** every file currently moved out. That list comes from replaying
   the journal and the undo journal: a file counts as moved if its latest
@@ -1052,7 +1067,7 @@ once you delete `duplicates`, without rehashing the volume. It is built from:
 
 It has the same columns as the raw listing (`filename, path, mtime, md5,
 size_gb`), so it can replace it anywhere: [`storage_report_by_year.R`](R_plots/storage_report_by_year.R),
-the cross-storage comparison, or `duplicates_check.py --resume-from`.
+the cross-storage comparison, or `duplicates_check_V2.py --resume-from`.
 
 It can be run before or after deleting `duplicates`; the result is the same.
 Tested against a real rescan after deleting `duplicates`: identical paths,
@@ -1078,7 +1093,7 @@ network round trip costs roughly 5–50 ms on a share.
 | `execute` | **Moving duplicates** | Per file, on `--workers` threads: stat original + destination, keeper check (once per group), create the destination folder, rename, append the note line, append the journal line. | **Yes**: a few round trips per file. Time depends on file count, not size. |
 | verify | Finding files in duplicates | Walks `<root>\duplicates` folder by folder. | Yes: one listing per folder |
 | verify | Collecting file info | One stat per file found. | Yes |
-| verify | **Hashing duplicates** | Reads every file in `duplicates` to compute its md5. Counts bytes, like duplicates_check.py. | **Yes: reads all the data.** Usually the longest step overall. |
+| verify | **Hashing duplicates** | Reads every file in `duplicates` to compute its md5. Counts bytes, like duplicates_check_V2.py. | **Yes: reads all the data.** Usually the longest step overall. |
 | verify | Indexing files found | Fingerprints every found path for fast lookup. | No |
 | verify | Comparing with the plan | Matches what was found against the journal by path + md5 and writes the report. | No |
 | `undo` | Restoring files | Per journaled file, on `--workers` threads: stat both locations, rename back. Notes are then rewritten once per folder per block. | Yes |
@@ -1100,7 +1115,7 @@ Shares usually handle many parallel stats well.
 
 **Time for `execute` on a large volume.** Each move takes a few network
 round trips (~4), so 6 million moves/files at ~20 ms per file would take more than a day on one thread. With `--workers 16` it's a few hours. Verify then
-re-reads all the moved data, like a duplicates_check.py scan of it.
+re-reads all the moved data, like a duplicates_check_V2.py scan of it.
 
 ### Resuming after a crash or kill
 
@@ -1144,12 +1159,12 @@ round it.
 
 | Subcommand | Argument | Description |
 |---|---|---|
-| `plan` | `--duplicates-csv` | `<stem>_folder_duplicates.csv` from `duplicates_check.py --folder`. Required. |
+| `plan` | `--duplicates-csv` | `<stem>_folder_duplicates.csv` from `duplicates_check_V2.py --folder`. Required. |
 | | `--summary-csv` | `<stem>_folder_summary.csv` from the same run. Required. |
-| | `--root` | The scanned folder (`--folder` of duplicates_check.py). `duplicates` is created directly under it. Required. |
+| | `--root` | The scanned folder (`--folder` of duplicates_check_V2.py). `duplicates` is created directly under it. Required. |
 | | `--output` | Folder for the plan and, later, all reports. Can't be inside `<root>\duplicates`. Required. |
 | | `--min-size` | Skip duplicates smaller than this: `500KB`, `1MB`, `2GB`, or bytes. Default: 0 (only empty files skipped). |
-| | `--exclude` | Extra folders or wildcard patterns never to move, case-insensitive: a folder path (`"R:\Program Files"`) means that folder and everything in it; a wildcard is matched against the file name or full path, e.g. `*.ini "*\Program Files\*"`. A folder must be under `--root`. The summary counts the duplicates excluded per pattern and warns about one that matched nothing. Same rules as in archive_old_files.py (*Excluding folders*). Always excluded: `desktop.ini`, `thumbs.db`, `*\.git\*`, `original_file_location.txt`. |
+| | `--exclude` | Extra folders or wildcard patterns never to move, case-insensitive: a folder path (`"R:\Program Files"`) means that folder and everything in it; a wildcard is matched against the file name or full path, e.g. `*.ini "*\Program Files\*"`. A folder must be under `--root`. The summary counts the duplicates excluded per pattern and warns about one that matched nothing. Same rules as in archive_old_files_V2.py (*Excluding folders*). Always excluded: `desktop.ini`, `thumbs.db`, `*\.git\*`, `original_file_location.txt`. |
 | | `--no-preflight` | Don't check the files on the volume while planning. Recommended for large volumes; `execute` still checks each file. |
 | | `--workers` | Threads for the pre-flight file checks. Default: 8. |
 | `execute` | `--plan` | The reviewed `move_plan_<timestamp>.csv`. Required. |
@@ -1157,12 +1172,12 @@ round it.
 | | `--no-verify` | Don't run verify afterwards. |
 | | `--retry-failed` | Only retry the files whose latest result is `ERROR`, `MOVE_FAILED` or `MOVE_TIMEOUT`; results go to `_execute_results__movedFailed.csv`, and verify checks only those files (`_verify_report__movedFailed.csv`). |
 | | `--workers` | Threads for moving files (and for hashing during verify with `--threading`). Default: 8. |
-| | `--threading` | Hash concurrently during verify (as in duplicates_check.py). |
+| | `--threading` | Hash concurrently during verify (as in duplicates_check_V2.py). |
 | `verify` | `--plan`, `--output`, `--threading`, `--workers` | As above. |
 | `undo` | `--plan`, `--output` | As above. |
 | | `--workers` | Threads for restoring files. Default: 8. |
 | `remaining` | `--plan`, `--output` | As above. |
-| | `--raw-csv` | duplicates_check.py's final `<stem>_raw.csv` of the same scan. Default: next to the plan's `--duplicates-csv`. |
+| | `--raw-csv` | duplicates_check_V2.py's final `<stem>_raw.csv` of the same scan. Default: next to the plan's `--duplicates-csv`. |
 | | `--workers` | Threads for hashing the location notes. Default: 8. |
 | all | `--io-timeout` | Seconds to wait for one filesystem operation (stat, rename, …) before giving up on it. Default: 10. |
 
@@ -1187,9 +1202,9 @@ aren't re-litigated.
 
 - **Move, don't delete.** A quarantine folder makes every mistake reversible
   until you delete it yourself.
-- **Keeper = oldest copy**, taken from `oldest_path` in duplicates_check.py's
+- **Keeper = oldest copy**, taken from `oldest_path` in duplicates_check_V2.py's
   summary. Ties (equal mtime) go to the first path alphabetically, as in
-  duplicates_check.py.
+  duplicates_check_V2.py.
 - **Mirrored folder structure** in `duplicates`: no name collisions, the
   origin is readable from the path, and undo is trivial.
 - **One appended `original_file_location.txt` per source folder**, one line
@@ -1226,7 +1241,7 @@ aren't re-litigated.
 - **Built for millions of files on an 8 GB machine.** No command loads a
   whole CSV. The duplicates CSV, plan, journal and raw listing are all
   streamed in blocks of 20,000 rows, small enough that every progress bar
-  moves at least about once a second. This relies on duplicates_check.py writing
+  moves at least about once a second. This relies on duplicates_check_V2.py writing
   the duplicates CSV sorted by md5, so each block holds whole groups; a file
   that isn't is refused. Sets of millions of paths (moved files, files found
   in `duplicates`) are kept as 8-byte fingerprints in sorted arrays instead
@@ -1234,7 +1249,7 @@ aren't re-litigated.
   about 1 in a million at 6M paths. Moves and restores run on `--workers`
   threads, because one at a time would take days at that scale. The only
   step that holds a whole list is verify's scan of `duplicates`, the same
-  scan duplicates_check.py does.
+  scan duplicates_check_V2.py does.
 - **Reports go to `--output`**, never inside `duplicates` (they would
   otherwise show up as `EXTRA` in their own verification).
 - **Not handled:** several plans moving into the same `duplicates` folder.
@@ -1245,13 +1260,13 @@ aren't re-litigated.
 
 ### Notes
 
-- **Long paths end to end:** duplicates_check.py uses the same `\\?\`
+- **Long paths end to end:** duplicates_check_V2.py uses the same `\\?\`
   handling (the shared `to_long_path` helper lives there), so files deeper
   than 260 characters are scanned, grouped and can be quarantined. Still
   check its `skipped_folders.csv`: folders can be skipped for other reasons
   (permissions, timeouts), and their files never reach this script.
 - Every filesystem operation has a timeout (`--io-timeout`), as in
-  duplicates_check.py, so an unreachable share or stuck handle is reported
+  duplicates_check_V2.py, so an unreachable share or stuck handle is reported
   instead of hanging the run. A rename that times out is reported as
   `MOVE_TIMEOUT`. Re-running `execute` finds out whether it completed.
 - The `duplicates` folder and the notes are ordinary files: deleting
@@ -1260,7 +1275,7 @@ aren't re-litigated.
 
 ---
 
-## archive_old_files.py
+## archive_old_files_V2.py
 
 Isolates old files so they can be moved from an active (expensive) storage to
 a tape (cheaper) archive. Every file whose **modification time** falls in a
@@ -1270,7 +1285,7 @@ where they are, untouched. The script never writes to tape: you copy
 `move_to_archive` to tape yourself, check it against the manifest, and delete
 it.
 
-It works like [`quarantine_duplicates.py`](#quarantine_duplicatespy), with the
+It works like [`quarantine_duplicates_V2.py`](#quarantine_duplicates_v2py), with the
 same safety mechanisms: a reviewable dry-run plan, `MOVE`↔`SKIP` as the only
 allowed edit, a journal, resume after a crash, `--retry-failed`, verify by md5,
 and `undo`.
@@ -1278,11 +1293,11 @@ and `undo`.
 ### Workflow at a glance
 
 ```
-1. archive_old_files.py plan     → (scans + hashes the storage, unless --raw-csv is given)
+1. archive_old_files_V2.py plan     → (scans + hashes the storage, unless --raw-csv is given)
                                  → archive_plan_<timestamp>.csv  (dry run)
 2. R_plots/archive_plan.R        → review the plan: what moves, per year, category and folder,
                                    and what stays and why (incl. the files of each skip reason)
-3. archive_old_files.py execute  → moves, notes, removes emptied folders, manifest, root index,
+3. archive_old_files_V2.py execute  → moves, notes, removes emptied folders, manifest, root index,
                                    then verify and <plan>_remaining_raw.csv
 4. R_plots/archive_execution.R   → what execute did: outcome, progress, verification,
                                    problems, folders (incl. the rows that weren't moved)
@@ -1299,8 +1314,8 @@ and `undo`.
    archive_manifest.csv, then delete move_to_archive
 
    When needed (before step 8):
-   archive_old_files.py verify   → re-run the md5 check alone
-   archive_old_files.py undo     → put everything back
+   archive_old_files_V2.py verify   → re-run the md5 check alone
+   archive_old_files_V2.py undo     → put everything back
 ```
 
 Steps 2, 4 and 5–7 are optional reporting and checks; they read the files the
@@ -1314,7 +1329,7 @@ step 8 comes before the next batch. For that batch, plan from the
 [Input: which listing to use](#input-which-listing-to-use)).
 
 The archive step is self-contained: without `--raw-csv`, `plan` scans and
-hashes the storage itself (the same scan as `duplicates_check.py --folder`).
+hashes the storage itself (the same scan as `duplicates_check_V2.py --folder`).
 With `--raw-csv` it reuses an existing listing and plans in minutes, so you
 can try several date ranges or categories against one scan.
 
@@ -1346,7 +1361,7 @@ Two exceptions:
   range, none of them move (`GIT_PARTIAL`), since moving part of a repository
   breaks it.
 - **A quarantine that isn't finalized.** While `<root>\duplicates` exists,
-  `quarantine_duplicates.py undo` is still possible, so folders holding a
+  `quarantine_duplicates_V2.py undo` is still possible, so folders holding a
   quarantine note are kept (`QUARANTINE_NOT_FINALIZED`). Delete `duplicates`
   first and plan again to include them.
 
@@ -1402,11 +1417,11 @@ on `LTO-0001`. Deleting the note instead would lose that link.
 - Python 3.10+
 - `pandas`, `numpy`, `tqdm`
 
-**`archive_old_files.py` imports helpers from `duplicates_check.py` (the
-scan) and `quarantine_duplicates.py` (journal, CSV streaming, file checks),
-so all three files must stay in the same folder.** You don't have to *run*
-either of the other two. If one is missing, the script stops at startup and
-names it.
+**`archive_old_files_V2.py` imports its helpers (the scan, plan and journal
+files, file checks, notes) from `diogenes_common.py`, so both files must stay
+in the same folder.** It doesn't need `duplicates_check_V2.py` or
+`quarantine_duplicates_V2.py`, nor do they have to be run first. If
+`diogenes_common.py` is missing, the script stops at startup and says so.
 
 ### Input: which listing to use
 
@@ -1416,17 +1431,17 @@ pass the **newest listing of the storage**:
 
 | What happened last on the storage | Listing to pass |
 |---|---|
-| nothing, or only a scan | `duplicates_check.py`'s `<stem>_raw.csv`, or nothing (let `plan` scan) |
-| a quarantine was executed | `quarantine_duplicates.py`'s `<plan>_remaining_raw.csv` |
+| nothing, or only a scan | `duplicates_check_V2.py`'s `<stem>_raw.csv`, or nothing (let `plan` scan) |
+| a quarantine was executed | `quarantine_duplicates_V2.py`'s `<plan>_remaining_raw.csv` |
 | an earlier archive was executed | this script's `<plan>_remaining_raw.csv` |
 
 An outdated listing can't do damage: files that no longer exist are skipped
 (`FILE_MISSING`), and `plan` warns when that's more than a few percent. The
 listing's paths must be under `--root` in the same spelling (`R:\` and
-`\\server\share\` count as different), as in `quarantine_duplicates.py`.
+`\\server\share\` count as different), as in `quarantine_duplicates_V2.py`.
 
 If the scan of `plan` is interrupted during hashing, the pre-hash listing it
-already wrote can be resumed with `duplicates_check.py --folder <root> --excel
+already wrote can be resumed with `duplicates_check_V2.py --folder <root> --excel
 <x> --resume-from <listing>`, and its final `_raw.csv` passed as `--raw-csv`.
 
 **Categories** (`--categories`, required) are worked out from the listing's
@@ -1436,7 +1451,7 @@ own md5 column, so every listing above works:
 |---|---|
 | `all` | every file in the date range (the only choice for a listing without md5) |
 | `unique` | its md5 occurs once on the storage |
-| `keeper` | the oldest copy of a duplicate group (ties: first path alphabetically, as in duplicates_check.py) |
+| `keeper` | the oldest copy of a duplicate group (ties: first path alphabetically, as in duplicates_check_V2.py) |
 | `duplicate` | the other copies |
 | `unreadable` | no md5 (couldn't be hashed) |
 
@@ -1452,7 +1467,7 @@ Run from the repository root.
 #### 1. Plan (dry run, moves nothing)
 
 ```powershell
-python archive_old_files.py plan `
+python archive_old_files_V2.py plan `
     --root   "R:\" `
     --output "C:\reports\archive" `
     --before 2016-01-01 `
@@ -1502,10 +1517,10 @@ quarantine note to update, and per folder to remove:
 | `md5`, `size_bytes`, `size_gb`, `mtime`, `modified` | from the listing (`modified` is UTC) |
 | `original_path`, `archive_path` | where it is now, where it goes |
 | `extra` | for `keeper_note` rows: the archived keeper |
-| `long_path`, `check` | as in quarantine_duplicates.py |
+| `long_path`, `check` | as in quarantine_duplicates_V2.py |
 
 **Editing the plan:** only `action` between `MOVE` and `SKIP`, as in
-quarantine_duplicates.py. Use R or a text editor, not Excel. Switching a
+quarantine_duplicates_V2.py. Use R or a text editor, not Excel. Switching a
 file to `SKIP` keeps its folder on the storage (`FOLDER_KEPT`).
 
 **Excluding folders (`--exclude`).** List one or more folders or patterns
@@ -1539,7 +1554,7 @@ date range it kept, with a **warning for a pattern that matched nothing**
 They can still be switched to `MOVE` by hand, they keep their
 folders (and the parent folders) on the storage, and they still count for the
 duplicate categories. `--exclude` doesn't shorten the scan: to skip folders in
-the scan too, scan with `duplicates_check.py --folder … --excluded <folders>`
+the scan too, scan with `duplicates_check_V2.py --folder … --excluded <folders>`
 and pass its `_raw.csv` as `--raw-csv` (their files then don't count for the
 categories either).
 
@@ -1572,7 +1587,7 @@ year), so they take longest on a large volume.
 #### 2. Execute
 
 ```powershell
-python archive_old_files.py execute --plan "C:\reports\archive\archive_plan_20261020_101500.csv" --workers 16
+python archive_old_files_V2.py execute --plan "C:\reports\archive\archive_plan_20261020_101500.csv" --workers 16
 ```
 
 1. Validates the plan, refuses if `move_to_archive` already holds another
@@ -1590,7 +1605,7 @@ python archive_old_files.py execute --plan "C:\reports\archive\archive_plan_2026
 
 Re-run the same command to resume after a crash or Ctrl+C. Retry only the
 files that failed (`ERROR`, `MOVE_FAILED`, `MOVE_TIMEOUT`) with
-`--retry-failed`, as in quarantine_duplicates.py; notes and emptied folders
+`--retry-failed`, as in quarantine_duplicates_V2.py; notes and emptied folders
 are always processed again. For `MOVE_FAILED` with *Access is denied*, see
 [`change_folder_permissions.py`](#change_folder_permissionspy).
 
@@ -1615,13 +1630,13 @@ still holds files.
 #### 4. Verify (runs automatically after execute)
 
 ```powershell
-python archive_old_files.py verify --plan "C:\reports\archive\archive_plan_20261020_101500.csv" --threading
+python archive_old_files_V2.py verify --plan "C:\reports\archive\archive_plan_20261020_101500.csv" --threading
 ```
 
 Re-hashes everything under `move_to_archive` and matches it to the journal by
 expected path and md5. Notes are only checked for presence, since their
 content grows by design. Writes `<plan>_verify_report.csv` with the
-quarantine_duplicates.py statuses (`OK`, `MISSING`, `MD5_MISMATCH`,
+quarantine_duplicates_V2.py statuses (`OK`, `MISSING`, `MD5_MISMATCH`,
 `UNREADABLE`, `EXTRA`, `MOVED_NOT_JOURNALED`, `NOT_MOVED`, `SKIPPED_<reason>`,
 `UNSCANNED_FOLDER`), plus `SIZE_MISMATCH` (listing without md5),
 `FOLDER_REMOVED` and `FOLDER_KEPT`.
@@ -1658,7 +1673,7 @@ the two directly.
 #### 5. Undo (before deleting `move_to_archive`)
 
 ```powershell
-python archive_old_files.py undo --plan "C:\reports\archive\archive_plan_20261020_101500.csv"
+python archive_old_files_V2.py undo --plan "C:\reports\archive\archive_plan_20261020_101500.csv"
 ```
 
 Moves every journaled file back, recreates the removed folders, removes every
@@ -1679,7 +1694,7 @@ files are back with identical paths, md5s and mtimes.
 | `FILE_MISSING` / `FILE_CHANGED` / `FILE_UNREADABLE` | the file is gone or differs from the listing (pre-flight, or `SKIPPED_…` in execute); for missing files, see [Missing files](#missing-files-gone-duplicates-or-a-problem) |
 | `FOLDER_KEPT` (execute) | the folder still holds files, a follower is set to `SKIP`, or the quarantine isn't finalized; `detail` says which |
 | `KEEPER_NOT_MOVED` (execute) | the keeper of a quarantine note wasn't moved, so the note wasn't changed |
-| `CONFLICT`, `MISSING`, `MOVED_RESUMED`, `ALREADY_MOVED` | as in quarantine_duplicates.py's *Resuming* table |
+| `CONFLICT`, `MISSING`, `MOVED_RESUMED`, `ALREADY_MOVED` | as in quarantine_duplicates_V2.py's *Resuming* table |
 
 ### Missing files: gone duplicates or a problem?
 
@@ -1694,7 +1709,7 @@ script moved. Take a listing made before a quarantine, or chained from one
 made before it:
 
 1. Batch 1 archives a group's keeper `A`. Its duplicate `B` isn't selected
-   (category `duplicate`), so nobody notices that `quarantine_duplicates.py`
+   (category `duplicate`), so nobody notices that `quarantine_duplicates_V2.py`
    has already moved `B` into `<root>\duplicates`.
 2. Batch 2 reads batch 1's remaining listing. That listing still has `B`,
    and no longer has `A`, which is on tape. Categories are recomputed from the
@@ -1703,7 +1718,7 @@ made before it:
 
 `B` is safe: it's in `duplicates\`, and its content is on tape as `A`. To
 avoid it, after a quarantine plan from that quarantine's remaining listing
-(`quarantine_duplicates.py remaining`), or from a rescan, not from an older
+(`quarantine_duplicates_V2.py remaining`), or from a rescan, not from an older
 listing. Files removed by users or other tools give `FILE_MISSING` the same
 way.
 
@@ -1739,7 +1754,7 @@ Inputs (set them in the configuration block, where each line is marked
 | `tape_index` (**required**) | The `_archived_to_tape.csv`. `NA` (default) = `<root>\_archived_to_tape.csv`, with the root recorded in each plan's settings; give a path to a copy if the storage isn't reachable from this machine, or if it's now reached by another drive letter or path. The script stops if it isn't found. It's created by the first `execute`, so a plan that was never executed can't be checked yet | what's on tape: path, md5, date, label |
 | `output_folder` (**required**) | Where the chart, table and CSVs are saved | |
 | `quarantine_journal` (optional, strongly recommended after a quarantine) | The quarantine's `move_plan_<ts>_journal.csv`, one or more, wildcards allowed (`move_plan_*_journal.csv`); its `_undo_journal.csv` is found automatically. `NA` if there was no quarantine | whether the quarantine moved the file, to which `duplicates_path`, and its `keeper_path` |
-| `duplicates_raw` (optional) | The duplicates_check.py `_raw.csv` the quarantine was planned from | whether the file was the keeper (oldest copy) in that run |
+| `duplicates_raw` (optional) | The duplicates_check_V2.py `_raw.csv` the quarantine was planned from | whether the file was the keeper (oldest copy) in that run |
 | `disk_result` (optional, for section 3) | The **folder** with the output of step 2: `archive_missing_disk.csv` and `archive_missing_disk_paths.csv`, with those names (by default the Python script writes them next to the path list, i.e. into `output_folder`). `NA` until step 2 has run | section 3 only |
 | `listing_path` (optional) | The listing(s) the plans were made from, wildcards allowed. `NA` (default) = the `raw_csv` recorded in each plan's `_settings.json` (e.g. the previous `_remaining_raw.csv`, or the scan's `_raw.csv`). Give it when that path doesn't exist on this machine: the plan was made elsewhere, or the folder has moved. Setup then prints `NOTE: listing not found …`, and without a listing the other copies of each content aren't known | the other copies of the same content |
 
@@ -1903,7 +1918,7 @@ with a quarantine note kept (`QUARANTINE_NOT_FINALIZED`).
 - **Move, don't copy or delete.** `os.rename` on the same volume is instant
   and needs no extra space; nothing is lost until you delete
   `move_to_archive` yourself, and `undo` reverses everything until then.
-- **Per file, by modification time**, as in elimination_file_candidates.py,
+- **Per file, by modification time**, as in elimination_file_candidates_V2.py,
   with the same mirrored structure as quarantine's `duplicates` folder.
 - **The plan step is the preview**: no separate analysis script. Re-planning
   from a listing is fast, so trying other cutoffs costs nothing.
@@ -1917,11 +1932,11 @@ with a quarantine note kept (`QUARANTINE_NOT_FINALIZED`).
 - **The remaining listing is written automatically**, so the next plan, a
   quarantine or the R reports always start from the current state without a
   multi-day rescan.
-- **Categories from the listing itself**, not from duplicates_check.py's
+- **Categories from the listing itself**, not from duplicates_check_V2.py's
   summary, so they work with any listing, including remaining listings.
 - **One batch at a time** in `move_to_archive`: a new plan refuses to start
   while it still holds files.
-- **Same scale design as quarantine_duplicates.py**: CSVs streamed in blocks
+- **Same scale design as quarantine_duplicates_V2.py**: CSVs streamed in blocks
   of 20,000 rows, path sets as 8-byte fingerprints, work on `--workers`
   threads, timeouts on every filesystem call, long paths through `\\?\`.
 
@@ -1930,7 +1945,7 @@ with a quarantine note kept (`QUARANTINE_NOT_FINALIZED`).
 ## change_folder_permissions.py
 
 A standalone helper, not part of the pipeline: run it by hand when needed.
-Typical case: `quarantine_duplicates.py execute` reports `MOVE_FAILED` with
+Typical case: `quarantine_duplicates_V2.py execute` reports `MOVE_FAILED` with
 `[WinError 5] Access is denied` for a folder and its subfolders, because the
 account can read there but not delete or rename. It has three steps, each
 run on its own:
@@ -1945,7 +1960,7 @@ run on its own:
 # 1. Modify for you on the folder that failed, then retry the moves
 python change_folder_permissions.py grant "\\server\share\data\problem_folder" --dry-run
 python change_folder_permissions.py grant "\\server\share\data\problem_folder"
-python quarantine_duplicates.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --retry-failed
+python quarantine_duplicates_V2.py execute --plan "C:\reports\quarantine\move_plan_20261006_121052.csv" --retry-failed
 
 # 2. Later, once you decide: read only for everyone else
 python change_folder_permissions.py lockdown "\\server\share\data" --exclude "\\server\share\data\instrument_backups"

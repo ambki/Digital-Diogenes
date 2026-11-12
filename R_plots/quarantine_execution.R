@@ -1,4 +1,4 @@
-# Quarantine execution report: what `quarantine_duplicates.py execute` (and
+# Quarantine execution report: what `quarantine_duplicates_V2.py execute` (and
 # verify / undo) actually did, from the files they write next to the plan:
 #   <plan>_execute_results.csv  outcome per MOVE row (last execute run only)
 #   <plan>_journal.csv          every completed move, all runs (timestamped)

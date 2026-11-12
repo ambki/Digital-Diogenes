@@ -15,7 +15,7 @@ OWNED_SUBFOLDERS = ["elimination_test"]
 
 # Buffer days added on top of --years so backdated/control mtimes land
 # comfortably on the right side of DateOffset(years=...)'s cutoff in
-# elimination_file_candidates.py, without needing pandas here just to match
+# elimination_file_candidates_V2.py, without needing pandas here just to match
 # its exact calendar arithmetic.
 BUFFER_DAYS = 400
 
@@ -120,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a folder structure with known old files, .zip files, and "
-            "'Unmixed' folder files, for testing elimination_file_candidates.py."
+            "'Unmixed' folder files, for testing elimination_file_candidates_V2.py."
         )
     )
     parser.add_argument(
@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         choices=["all", "old", "zip", "unmixed"],
         default="all",
         help=(
-            "Which elimination_file_candidates.py group to build a scenario "
+            "Which elimination_file_candidates_V2.py group to build a scenario "
             "for (default: all, builds every group plus a file overlapping "
             "all three)."
         ),
@@ -144,7 +144,7 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help=(
             "Age threshold (in years) to build fixtures around. Should match "
-            "the --years you'll pass to elimination_file_candidates.py "
+            "the --years you'll pass to elimination_file_candidates_V2.py "
             "(default: 10)."
         ),
     )
@@ -206,7 +206,7 @@ def main() -> None:
 
     print(f"\nCreated elimination-candidates scenario at: {root}  ({len(files)} files)")
     print(
-        "  Run: python elimination_file_candidates.py "
+        "  Run: python elimination_file_candidates_V2.py "
         f'--folder "{root}" --years {args.years}'
     )
     print(

@@ -272,7 +272,7 @@ def resolve_account(account: str | None, account_from: str | None = None, folder
             f"WARNING: {sid} is a cloud (Entra ID) account ID, as this PC knows the account. A file server in an\n"
             "on-premises domain usually knows it by another ID (S-1-5-21-...), and a grant to this one would not\n"
             "apply there. To use the server's ID: --account-from <a folder this account created on that share>,\n"
-            "e.g. the duplicates folder made by quarantine_duplicates.py execute."
+            "e.g. the duplicates folder made by quarantine_duplicates_V2.py execute."
         )
     return sid, lookup_sid(sid)
 

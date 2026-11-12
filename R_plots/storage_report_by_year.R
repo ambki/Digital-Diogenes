@@ -1,10 +1,10 @@
 # Storage composition by year: unique vs. duplicate vs. zip vs. unmixed data.
 #
-# Inputs are the CSV outputs of duplicates_check.py and
-# elimination_file_candidates.py run with --excel against the SAME folder:
-#   - duplicates_check.py's companion "..._raw.csv"        (needs: path, mtime, md5, size_gb)
-#   - elimination_file_candidates.py's "..._zip_files.csv"      (needs: path)
-#   - elimination_file_candidates.py's "..._unmixed_files.csv"  (needs: path)
+# Inputs are the CSV outputs of duplicates_check_V2.py and
+# elimination_file_candidates_V2.py run with --excel against the SAME folder:
+#   - duplicates_check_V2.py's companion "..._raw.csv"        (needs: path, mtime, md5, size_gb)
+#   - elimination_file_candidates_V2.py's "..._zip_files.csv"      (needs: path)
+#   - elimination_file_candidates_V2.py's "..._unmixed_files.csv"  (needs: path)
 # The last section also compares two storages' "..._raw.csv" exports against
 # each other by md5 (see "Cross-storage duplicates" at the end).
 #
@@ -67,8 +67,8 @@ output_cumulative_root_csv <- file.path(output_folder, "cumulative_growth_by_wor
 
 # ---- Load ---------------------------------------------------------------
 # Accepts either the current CSV outputs or an older .xlsx report from
-# before the CSV switch - duplicates_check.py's raw file used to be
-# "..._raw.xlsx" (sheet "all_files"), and elimination_file_candidates.py's
+# before the CSV switch - duplicates_check_V2.py's raw file used to be
+# "..._raw.xlsx" (sheet "all_files"), and elimination_file_candidates_V2.py's
 # zip/unmixed listings used to live as "zip_files"/"unmixed_files" sheets in
 # one workbook rather than separate CSVs. The column schemas are identical
 # either way - only the container format changed - so reading either into
@@ -85,8 +85,8 @@ read_table_flex <- function(path, sheet) {
   }
 }
 
-# Prefer duplicates_check.py's raw export (has md5, enables duplicate
-# detection); fall back to elimination_file_candidates.py's own raw export
+# Prefer duplicates_check_V2.py's raw export (has md5, enables duplicate
+# detection); fall back to elimination_file_candidates_V2.py's own raw export
 # (same filename/path/mtime/size_gb columns, just no md5) if the duplicates
 # report isn't available yet - e.g. an interim report run before duplicates
 # data has arrived. Falling back here is what makes that fallback actually
@@ -150,14 +150,14 @@ for (ov in year_overrides) {
 # qualify for more than one group). "Duplicate" means specifically the
 # redundant copies - within each identical-content (md5) group, the OLDEST
 # copy is kept as "Unique" and the rest are "Duplicate", mirroring
-# duplicates_check.py's own oldest-copy-is-kept logic.
+# duplicates_check_V2.py's own oldest-copy-is-kept logic.
 #
 # If `duplicates_raw_path` doesn't have an "md5" column (e.g. for an interim
-# report run before duplicates_check.py's output is available - elimination's
+# report run before duplicates_check_V2.py's output is available - elimination's
 # own raw export has no md5, since it never hashes), duplicate detection is
 # skipped entirely rather than erroring: every file counts as not-duplicate,
 # giving a Unique/Zip/Unmixed/Old breakdown now. Point `duplicates_raw_path`
-# at the real duplicates_check.py raw export later and this picks duplicate
+# at the real duplicates_check_V2.py raw export later and this picks duplicate
 # detection back up automatically - no other change needed.
 
 has_duplicate_data <- "md5" %in% names(files)
@@ -166,7 +166,7 @@ if (!has_duplicate_data) {
     "\nNo 'md5' column in duplicates_raw_path - treating this as an interim ",
     "report with no duplicate data yet (Unique/Zip/Unmixed/Old only). The ",
     "'Duplicate' category and the top-wasted-directories chart will be empty ",
-    "until you point duplicates_raw_path at duplicates_check.py's raw export.\n",
+    "until you point duplicates_raw_path at duplicates_check_V2.py's raw export.\n",
     sep = ""
   )
 }
@@ -836,7 +836,7 @@ ggsave(output_cumulative_root_png, p_cumulative_root,
        width = 14, height = 2 + 3.2 * ceiling(n_roots / root_ncol), dpi = 150, limitsize = FALSE)
 
 # ---- Cross-storage duplicates (from two existing raw exports) --------------
-# Same question as `duplicates_check.py --origin A --destination B --mode
+# Same question as `duplicates_check_V2.py --origin A --destination B --mode
 # between` - which file contents exist in BOTH storages, regardless of path
 # or filename - but answered from two duplicates_raw_file exports that were
 # already produced by separate `--folder` runs. Those already carry an md5 per
@@ -895,7 +895,7 @@ read_raw_md5 <- function(path, label) {
   if (tolower(tools::file_ext(path)) == "csv") {
     header <- names(read_csv(path, n_max = 0, show_col_types = FALSE))
     if (!"md5" %in% header) {
-      stop(sprintf("'%s' has no md5 column - point it at duplicates_check.py's final raw export, not the pre-hash one.", path))
+      stop(sprintf("'%s' has no md5 column - point it at duplicates_check_V2.py's final raw export, not the pre-hash one.", path))
     }
     df <- read_csv(
       path,
@@ -946,7 +946,7 @@ cross_files <- bind_rows(files_a, files_b) %>%
 rm(files_a, files_b)
 
 # ---- Cross-storage: between summary (one row per shared md5) ----------------
-# Same columns as duplicates_check.py's between_summary: count/size/total/
+# Same columns as duplicates_check_V2.py's between_summary: count/size/total/
 # wasted plus the oldest copy (the one to keep) and which storage it lives
 # in. Paths are " | "-separated rather than a JSON list, so the CSV reads fine
 # in Excel too.
