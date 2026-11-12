@@ -337,8 +337,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--plots-dir",
-        default="elimination_plots",
-        help="Directory to save barplot PNGs into. Default: 'elimination_plots'.",
+        help=(
+            "Directory to save barplot PNGs into. Default: 'elimination_plots' "
+            "next to the --excel file, or in the current folder without --excel."
+        ),
     )
     parser.add_argument(
         "--no-plots",
@@ -383,6 +385,12 @@ def parse_args() -> argparse.Namespace:
             f"--excel must be a path to a file (e.g. ending in .xlsx), "
             f"not a folder: {args.excel}"
         )
+
+    if args.plots_dir is None:
+        # Next to the other outputs rather than in the current folder, which
+        # may not be writable (an admin terminal starts in C:\Windows\System32).
+        base = Path(args.excel).resolve().parent if args.excel else Path.cwd()
+        args.plots_dir = str(base / "elimination_plots")
 
     if args.io_timeout <= 0:
         parser.error("--io-timeout must be a positive number.")
@@ -445,9 +453,6 @@ def main() -> None:
     global_summary = build_global_summary(group_summaries, group_dfs)
     print_global_report(global_summary)
 
-    if not args.no_plots:
-        plot_storage_size_barplots(group_summaries, global_summary, args.plots_dir)
-
     if args.excel:
         # Each group's full file list is written as its own CSV rather than
         # a workbook sheet — a group like "old_files" can easily hold
@@ -467,6 +472,17 @@ def main() -> None:
             group_csv = excel_path.with_name(f"{excel_path.stem}_{group}.csv")
             write_csv(df_group, group_csv)
             print(f"{GROUP_LABELS[group]} listing written to: {group_csv}")
+
+    # Last, so a folder that can't be written only costs the plot, not the
+    # reports of a scan that may have taken hours.
+    if not args.no_plots:
+        try:
+            plot_storage_size_barplots(group_summaries, global_summary, args.plots_dir)
+        except OSError as exc:
+            print(
+                f"\nWARNING: barplots not written ({type(exc).__name__}: {exc}). "
+                "Use --plots-dir to pick a folder you can write to, or --no-plots."
+            )
 
 
 if __name__ == "__main__":

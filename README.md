@@ -648,7 +648,7 @@ python elimination_file_candidates_V2.py --folder "C:\path\to\folder" --no-plots
 | `--folder`    | Folder to scan recursively. Required.                                                  |
 | `--years`     | Age threshold in years for the "old files" group. Default: 10.                         |
 | `--excel`     | Optional path to write results to an Excel workbook (summary/skipped-folders sheets), plus a companion raw CSV (every file scanned) and one CSV per group with its full per-file listing (see above). |
-| `--plots-dir` | Directory to save barplot PNGs into. Default: `elimination_plots`.                     |
+| `--plots-dir` | Directory to save barplot PNGs into. Default: `elimination_plots` next to the `--excel` file, or in the current folder without `--excel`. If the folder can't be written, the run still finishes with a warning (the reports are written first). |
 | `--no-plots`  | Skip generating barplots.                                                              |
 | `--io-timeout` | Seconds to wait for a single blocking filesystem operation (listing a folder or stat'ing a file) before giving up on it and moving on. Default: 30. |
 | `--included`   | Restrict the scan to only these subfolder(s) (and their contents), under `--folder`. One or more paths. Mutually exclusive with `--excluded`. Default: scan everything. |
